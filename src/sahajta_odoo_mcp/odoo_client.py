@@ -11,6 +11,8 @@ This module knows nothing about safety rules; callers must go through OdooServic
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import hashlib
 import http.cookiejar
 import itertools
 from dataclasses import dataclass, field
@@ -106,6 +108,7 @@ class OdooClient:
         protocol: str = "auto",
         timeout: float = 30.0,
         max_parallel: int = 1,
+        cache=None,
     ):
         self.creds = creds
         self._http = http
@@ -114,6 +117,9 @@ class OdooClient:
         self._max_parallel = max(1, max_parallel)
         # JSON-2 replaces the server-side context with the one sent, so lang/tz go on every call.
         self._base_context: dict = {}
+        # Optional shared cache (Redis on serverless): lets a fresh server instance skip the identity calls.
+        self._cache = cache
+        self._probe_ctx: dict | None = None
         self._uid: int | None = None
         self._identity: OdooIdentity | None = None
         self._lock = asyncio.Lock()
@@ -162,8 +168,25 @@ class OdooClient:
         async with self._lock:
             if self._identity is not None:
                 return self._identity
+            cache_key = "identity:v1:" + hashlib.sha256(
+                f"{self.creds.url}|{self.creds.db}|{self.creds.login}|{self.creds.api_key}".encode()
+            ).hexdigest()
+            cached = self._cache.get_json(cache_key) if self._cache is not None else None
+            if cached:
+                try:
+                    identity = OdooIdentity(**cached["identity"])
+                    protocol, base_context = cached["protocol"], dict(cached["base_context"])
+                except (KeyError, TypeError, ValueError):
+                    identity = None  # unreadable entry (e.g. older format): look the identity up again
+                if identity is not None:
+                    self._protocol = protocol
+                    self._uid = identity.uid if protocol == "jsonrpc" else self._uid
+                    self._base_context = base_context
+                    self._identity = identity
+                    return self._identity
             await self._ensure_protocol_locked()
-            ctx = await self.call("res.users", "context_get")
+            # the JSON-2 probe already returned context_get; don't ask twice
+            ctx = self._probe_ctx if self._probe_ctx is not None else await self.call("res.users", "context_get")
             uid = ctx.get("uid") if isinstance(ctx, dict) else None
             if not isinstance(uid, int):
                 uid = self._uid
@@ -189,6 +212,12 @@ class OdooClient:
                 server_version=await self.server_version(),
                 protocol=self._protocol,
             )
+            if self._cache is not None:
+                self._cache.set_json(
+                    cache_key,
+                    {"protocol": self._protocol, "base_context": self._base_context, "identity": dataclasses.asdict(self._identity)},
+                    600,
+                )
             return self._identity
 
     async def server_version(self) -> str:
@@ -222,8 +251,9 @@ class OdooClient:
         # auto: probe the JSON-2 route. Odoo <= 18 answers 404, or (with the web module) a redirect to the
         # login page, or some non-JSON page: all mean "no JSON-2 here".
         try:
-            await self._call_json2("res.users", "context_get", ids=None, context=None, kwargs={})
+            probe = await self._call_json2("res.users", "context_get", ids=None, context=None, kwargs={})
             self._protocol = "json2"
+            self._probe_ctx = probe if isinstance(probe, dict) else None
         except OdooError as exc:
             no_json2 = exc.status == 404 or (exc.status is not None and 300 <= exc.status < 400) or exc.odoo_name is None
             if no_json2 and exc.kind != "auth":

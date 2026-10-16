@@ -142,6 +142,41 @@ HARD_READONLY_PREFIXES: tuple[str, ...] = (
     "spreadsheet.revision",
     "documents.share",
     "knowledge.invite",
+    # accounting configuration: a wrong edit silently corrupts every future entry and report
+    "account.account",
+    "account.tax",
+    "account.fiscal.position",
+    "account.journal",
+    "account.report",
+    "account.reconcile.model",
+    "account.payment.method",
+    "account.cash.rounding",
+    "account.code.mapping",
+    "account.root",
+    "account.group",
+    "account.return.type",
+    "account.return.check.template",
+    "account.online.",  # bank-sync connections
+    "decimal.precision",
+    # Odoo's own AI agents and prompts (an AI must not rewrite another AI's instructions)
+    "ai.",
+    # e-mail infrastructure, outside guests, digests
+    "digest.",
+    "mail.ice.server",
+    "mail.gateway.allowed",
+    "mail.guest",
+    "res.country",
+    "spreadsheet.dashboard.share",  # creates a public link to a dashboard
+)
+
+# Writable only with MCP_ALLOW_OUTBOUND_MESSAGES: creating these e-mails or shares with outside people.
+OUTBOUND_GATED_PREFIXES: tuple[str, ...] = (
+    "sign.request",  # creating a signature request e-mails the signers
+    "sign.send.request",
+    "survey.invite",
+    "project.collaborator",  # shares the project with portal users
+    "portal.share",
+    "appointment.invite",
 )
 
 # Note: communication models (mail.compose.message, mailing.*, sms.*, whatsapp.*, snailmail.*) are in the
@@ -252,6 +287,7 @@ ARCHIVE_METHODS: frozenset[str] = frozenset({"toggle_active", "action_archive", 
 
 CANCEL_METHOD_PARTS: tuple[str, ...] = (
     "cancel",
+    "close",  # e.g. closing (churning) a subscription
     "reverse",
     "reversal",
     "refund",
@@ -325,6 +361,7 @@ HARD_BLOCKED_PREFIXES: tuple[str, ...] = (
     "iap.account",
     "fetchmail",
     "ir.mail_server",
+    "certificate.",  # e-invoicing certificates and their private keys
 )
 
 
@@ -369,6 +406,11 @@ class SafetyPolicy:
             return reason
         if not self.settings.read_write:
             return "this server is in read-only mode (MCP_ACCESS_MODE=read_only)"
+        if model.startswith(OUTBOUND_GATED_PREFIXES) and not self.settings.mcp_allow_outbound_messages:
+            return (
+                f"'{model}' e-mails or shares with people outside the company, which is disabled "
+                "(MCP_ALLOW_OUTBOUND_MESSAGES=false)"
+            )
         for prefix in HARD_READONLY_PREFIXES:
             if model == prefix.rstrip(".") or model.startswith(prefix):
                 return (
@@ -519,7 +561,7 @@ _OUTBOUND_SUBSTRINGS = ("mail", "email", "sms", "whatsapp", "send")
 
 # Button captions are checked too, as phrases: "Create Draft" is fine, "Reset to Draft" is not.
 _CANCEL_LABEL_RE = re.compile(
-    r"\b(cancel\w*|reset\b|set to draft|reset to draft|revert\w*|unlock\w*|refuse\w*|reject\w*|mark as lost|"
+    r"\b(cancel\w*|close\b|reset\b|set to draft|reset to draft|revert\w*|unlock\w*|refuse\w*|reject\w*|mark as lost|"
     r"lost\b|reverse\w*|reversal|refund\w*|credit note|restore\w*|archive\w*|unarchive\w*)"
 )
 _OUTBOUND_LABEL_RE = re.compile(

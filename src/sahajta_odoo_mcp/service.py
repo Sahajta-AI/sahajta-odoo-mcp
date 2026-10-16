@@ -83,6 +83,7 @@ class Shared:
     limiter: RateLimiter
     http: httpx.AsyncClient
     button_cache: dict
+    state: object = None  # shared cache / single-use / rate-limit store (Redis on serverless)
 
 
 class OdooService:
@@ -262,6 +263,13 @@ class OdooService:
         wanted = ["write_date", *[f for f in fields if f in known and f != "write_date"]]
         rows = await self.client.call(model, "read", ids=ids, fields=wanted, context={"active_test": False})
         return {str(row["id"]): {f: row.get(f) for f in wanted} for row in rows or []}
+
+    def _call_context(self, model: str, ctx: dict) -> dict | None:
+        """Context actually sent with a change. With outbound messages off, calendar changes must not
+        e-mail invitations to attendees (Odoo sends them automatically otherwise)."""
+        if not self.settings.mcp_allow_outbound_messages and model.startswith(("calendar.", "appointment.")):
+            return {**ctx, "no_mail_to_attendees": True}
+        return ctx or None
 
     def _require_read_write(self) -> None:
         if not self.settings.read_write:
@@ -670,7 +678,7 @@ class OdooService:
             normalized, ctx, payload = await self._prepare_create(model, records, context)
             if self.settings.mcp_require_preview:
                 self.shared.signer.verify(confirm_token, payload)
-            result = await self.client.call(model, "create", vals_list=normalized, context=ctx or None)
+            result = await self.client.call(model, "create", vals_list=normalized, context=self._call_context(model, ctx))
             new_ids = result if isinstance(result, list) else [result]
             names = await self._names(model, set(new_ids))
             return {
@@ -754,7 +762,7 @@ class OdooService:
             id_list, normalized, ctx, payload = await self._prepare_update(model, ids, values, context)
             if self.settings.mcp_require_preview:
                 self.shared.signer.verify(confirm_token, payload)
-            await self.client.call(model, "write", ids=id_list, vals=normalized, context=ctx or None)
+            await self.client.call(model, "write", ids=id_list, vals=normalized, context=self._call_context(model, ctx))
             fields = await self._fields(model)
             scalar = [n for n in normalized if fields[n].get("type") not in ("one2many", "many2many")]
             after = await self.client.call(
@@ -817,7 +825,7 @@ class OdooService:
             id_list, ctx, payload, button = await self._prepare_action(model, ids, method, context)
             if self.settings.mcp_require_preview:
                 self.shared.signer.verify(confirm_token, payload)
-            result = await self.client.call(model, method, ids=id_list, context=ctx or None)
+            result = await self.client.call(model, method, ids=id_list, context=self._call_context(model, ctx))
             fields = await self._fields(model)
             show = ["display_name"] + [f for f in ("state", "stage_id") if f in fields]
             present, _ = await self._existing(model, id_list)

@@ -43,12 +43,13 @@ def build_shared(settings: Settings, secret: bytes, http: httpx.AsyncClient | No
     return Shared(
         settings=settings,
         policy=SafetyPolicy(settings),
-        schema=SchemaCache(),
+        schema=SchemaCache(shared=state),
         signer=ConfirmationSigner(secret, state=state),
         audit=AuditLog(settings.mcp_audit_log_file),
         limiter=RateLimiter(settings.mcp_reads_per_minute, settings.mcp_writes_per_minute, state=state),
         http=http or new_http_client(verify=settings.odoo_verify_tls),
         button_cache={},
+        state=state,
     )
 
 
@@ -59,6 +60,9 @@ def _new_server(**auth_kwargs) -> MCPServer:
         description="Read and (if enabled) safely update Odoo ERP data. Records can never be deleted.",
         instructions=INSTRUCTIONS,
         version=__version__,
+        # No server-to-client notifications here (the tool list never changes), so no
+        # `subscriptions/listen` streams: on serverless hosts they only sit open until the platform kills them.
+        subscriptions=False,
         **auth_kwargs,
     )
 
@@ -73,6 +77,7 @@ def create_stdio_server(settings: Settings, http: httpx.AsyncClient | None = Non
         protocol=settings.odoo_protocol,
         timeout=settings.odoo_timeout_seconds,
         max_parallel=settings.odoo_max_parallel_requests,
+        cache=shared.state,
     )
     holder: dict[str, OdooService] = {}
 
@@ -111,7 +116,7 @@ def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
             creds = oauth.credentials_for(token)
             client = OdooClient(
                 creds, shared.http, protocol=settings.odoo_protocol, timeout=settings.odoo_timeout_seconds,
-                max_parallel=settings.odoo_max_parallel_requests,
+                max_parallel=settings.odoo_max_parallel_requests, cache=shared.state,
             )
             identity = await client.identity()
         except OdooError as exc:
@@ -161,4 +166,22 @@ def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
                 await shared.http.aclose()
 
     app.router.lifespan_context = lifespan
-    return app
+    return _NoListenStream(app)
+
+
+class _NoListenStream:
+    """Declines the optional GET /mcp notification stream (allowed by the MCP spec: 405).
+
+    This server never sends server-initiated messages, and serverless hosts cut long-lived
+    requests off after their time limit, so an open stream would only hang there.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"] == "/mcp" and scope["method"] == "GET":
+            await send({"type": "http.response.start", "status": 405, "headers": [(b"allow", b"POST"), (b"content-length", b"0")]})
+            await send({"type": "http.response.body", "body": b""})
+            return
+        await self.app(scope, receive, send)

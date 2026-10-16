@@ -7,8 +7,11 @@ rate limits must add up across instances.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import time
+import zlib
 from collections import defaultdict, deque
 from typing import Protocol
 
@@ -22,11 +25,30 @@ class SharedState(Protocol):
     def hit(self, key: str, limit: int, window_seconds: int) -> bool:
         """Counts one event; True while the count within the window is at most `limit`."""
 
+    def get_json(self, key: str):
+        """A cached JSON value, or None."""
+
+    def set_json(self, key: str, value, ttl_seconds: int) -> None:
+        """Caches a JSON value for `ttl_seconds`."""
+
 
 class MemoryState:
     def __init__(self) -> None:
         self._claims: dict[str, int] = {}
         self._hits: dict[str, deque[float]] = defaultdict(deque)
+        self._cache: dict[str, tuple[float, object]] = {}
+
+    def get_json(self, key: str):
+        hit = self._cache.get(key)
+        if hit and hit[0] > time.monotonic():
+            return hit[1]
+        self._cache.pop(key, None)
+        return None
+
+    def set_json(self, key: str, value, ttl_seconds: int) -> None:
+        if len(self._cache) > 2000:
+            self._cache.clear()
+        self._cache[key] = (time.monotonic() + ttl_seconds, value)
 
     def claim_once(self, key: str, expires_at: int) -> bool:
         now = int(time.time())
@@ -66,6 +88,27 @@ class RedisState:
             pipe.expire(name, window_seconds * 2)
             count, _ = pipe.execute()
         return int(count) <= limit
+
+    def get_json(self, key: str):
+        try:
+            raw = self._r.get(self._cache_name(key))
+            return json.loads(zlib.decompress(base64.b64decode(raw))) if raw else None
+        except (redis.RedisError, ValueError, zlib.error):
+            return None  # a cache problem must never break a request
+
+    def set_json(self, key: str, value, ttl_seconds: int) -> None:
+        try:
+            blob = base64.b64encode(zlib.compress(json.dumps(value, separators=(",", ":")).encode(), 6)).decode()
+            if len(blob) <= _MAX_CACHED_BYTES:
+                self._r.set(self._cache_name(key), blob, ex=ttl_seconds)
+        except (redis.RedisError, TypeError, ValueError):
+            pass
+
+    def _cache_name(self, key: str) -> str:
+        return f"{self._prefix}cache:{hashlib.sha256(key.encode()).hexdigest()}"
+
+
+_MAX_CACHED_BYTES = 800_000  # stay well under Upstash's per-request size limit
 
 
 def redis_client(url: str) -> redis.Redis:

@@ -46,7 +46,12 @@ wizards, devices and login logs, `ir.config_parameter`, mail servers, IAP accoun
 settings (`res.config.settings`), server actions, scheduled actions, automation rules, access rules, record
 rules, module install/upgrade/uninstall, import, partner/data merge, logging, sessions and bus.
 
-**Readable but never writable**: all technical `ir.*` models (views, menus, sequences, attachments…), users and
+**E-invoicing certificates and their private keys** (`certificate.*`) are blocked entirely.
+
+**Readable but never writable**: accounting configuration (chart of accounts, taxes, fiscal positions, journals,
+report definitions, reconciliation models, payment methods, decimal precision), bank-sync connections, Odoo's
+own AI agents and prompts, e-mail digests and gateway settings, chat guests, public dashboard share links,
+countries, all technical `ir.*` models (views, menus, sequences, attachments…), users and
 groups (prevents privilege escalation and paid-seat creation), companies, currencies and rates, languages,
 mail templates, mail queue, followers, aliases, mass mailing, SMS, WhatsApp, postal mail, website code and pages,
 accounting lock dates.
@@ -61,13 +66,18 @@ with `MCP_ALLOW_ARCHIVE=true`.
 **Methods (buttons)**: only methods that appear as a button on the model's own Odoo screens can be pressed (or
 ones an admin lists in `MCP_EXTRA_ALLOWED_METHODS`). Never: payment-provider operations (capture, void, payouts,
 transactions), anything touching passwords, keys, modules, impersonation or `sudo`. Off unless enabled:
-archive; cancel/reset/draft/unlock/refuse/reject/lost; send/mail/SMS/WhatsApp/invite/share/notify.
+archive; cancel/close/reset/draft/unlock/refuse/reject/lost; send/mail/SMS/WhatsApp/invite/share/notify.
 
 **Context**: only `active_id(s)` (at most the per-change cap), `active_model` (must be a model the AI may change,
 since wizards act on it), `lang`, `tz`, `allowed_company_ids` and `default_<field>` (validated like a field
 value). `active_domain` is refused because it would let a wizard act on every matching record. Keys that hide changes from the audit trail
 (`tracking_disable`, `mail_notrack`, …) or skip checks (`check_move_validity`, `force_*`, `skip_*`, `bypass_*`)
 are refused.
+
+**Sharing with outsiders** (writable only with `MCP_ALLOW_OUTBOUND_MESSAGES=true`): Sign requests (creating one
+e-mails the signers), survey invitations, project collaborators (portal sharing), portal share links and
+appointment invites. With outbound messages off, calendar and appointment changes are sent with Odoo's
+`no_mail_to_attendees` flag, so attendees are not e-mailed invitations.
 
 **Messages**: internal notes are posted as escaped plain text with the internal-note subtype (no e-mail to
 anyone). Messages to followers (which e-mail customers) need `MCP_ALLOW_OUTBOUND_MESSAGES=true` and always need
