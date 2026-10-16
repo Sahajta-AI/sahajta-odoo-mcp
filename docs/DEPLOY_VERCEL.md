@@ -21,7 +21,7 @@ so Redis is required; the app refuses to start without it.
 | `ODOO_PROTOCOL` | `auto` |
 | `MCP_PUBLIC_URL` | the production URL, e.g. `https://sahajta-odoo-mcp.vercel.app` (no trailing slash) |
 | `MCP_SECRET` | random 48+ characters (sensitive). Changing it signs everyone out |
-| `MCP_ALLOWED_LOGINS` | `shubhangsethi@gmail.com`: the only Odoo login that may connect |
+| `MCP_ALLOWED_LOGINS` | `person@example.com`: the only Odoo login that may connect |
 | `MCP_ACCESS_MODE` | `read_only` to start; `read_write` to allow changes (with preview + approval) |
 | `MCP_TRUST_PROXY_HEADERS` | `true` |
 | `REDIS_URL` / `KV_URL` | set automatically when Upstash Redis is connected to the project |
@@ -43,6 +43,6 @@ After changing a variable, redeploy for it to take effect.
 * **Cut off access instantly:** delete the API key in Odoo (*My Preferences → Account Security*).
 * **See logs:** Vercel → project → Logs. Every tool call is a JSON line with `"event": "odoo_mcp_call"`.
 * **Revoke the sign-in from your laptop:** with `REDIS_URL` set to the Upstash URL in your shell, run
-  `python -m sahajta_odoo_mcp.oauth.admin list` / `revoke --login shubhangsethi@gmail.com`.
+  `python -m sahajta_odoo_mcp.oauth.admin list` / `revoke --login person@example.com`.
 * **Switch to read-write:** set `MCP_ACCESS_MODE=read_write`, redeploy, then reconnect in Claude so it sees the
   new tools.
