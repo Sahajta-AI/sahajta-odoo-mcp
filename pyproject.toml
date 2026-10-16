@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sahajta-odoo-mcp"
+version = "1.0.0"
+description = "Safety-first MCP server that lets Claude read and (optionally) update Odoo, with no delete capability."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "mcp>=2.3,<3",
+    "httpx>=0.28,<1",
+    "pydantic>=2.10,<3",
+    "pydantic-settings>=2.7,<3",
+    "cryptography>=44",
+    "uvicorn>=0.34",
+    "starlette>=0.46",
+    "python-multipart>=0.0.20",
+    "redis>=5.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.25", "respx>=0.22", "fakeredis[lua]>=2.26"]
+
+[project.scripts]
+sahajta-odoo-mcp = "sahajta_odoo_mcp.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sahajta_odoo_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["integration: needs a live Odoo test server (see tests/README.md)"]

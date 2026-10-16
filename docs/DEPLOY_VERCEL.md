@@ -1,0 +1,48 @@
+# Deploying on Vercel
+
+The connector runs as a Python function (`app.py`) with Upstash Redis for shared state (sign-ins,
+one-time approvals, rate limits). Vercel functions keep no files and can run as several copies at once,
+so Redis is required; the app refuses to start without it.
+
+## Project settings
+
+| Setting | Value |
+|---|---|
+| Project | `sahajta-odoo-mcp` (framework preset: Python) |
+| Region | `bom1` (Mumbai), close to the Odoo database |
+| Deployment protection | Standard: previews are private, the production domain is public (Claude must reach it) |
+| Plan | Vercel's terms require **Pro** for commercial use |
+
+## Environment variables
+
+| Variable | Value |
+|---|---|
+| `ODOO_URL` | `https://sahajta.odoo.com` |
+| `ODOO_PROTOCOL` | `auto` |
+| `MCP_PUBLIC_URL` | the production URL, e.g. `https://sahajta-odoo-mcp.vercel.app` (no trailing slash) |
+| `MCP_SECRET` | random 48+ characters (sensitive). Changing it signs everyone out |
+| `MCP_ALLOWED_LOGINS` | `shubhangsethi@gmail.com`: the only Odoo login that may connect |
+| `MCP_ACCESS_MODE` | `read_only` to start; `read_write` to allow changes (with preview + approval) |
+| `MCP_TRUST_PROXY_HEADERS` | `true` |
+| `REDIS_URL` / `KV_URL` | set automatically when Upstash Redis is connected to the project |
+
+No Odoo API key is stored in Vercel. The person connecting types their login and key on the sign-in page;
+the key is stored encrypted (with `MCP_SECRET`) in Redis.
+
+After changing a variable, redeploy for it to take effect.
+
+## Connecting Claude
+
+1. In Claude: *Settings → Connectors → Add custom connector*.
+2. Name `Sahajta Odoo`, URL `https://sahajta-odoo-mcp.vercel.app/mcp`. Leave the OAuth fields empty.
+3. Click **Connect**. A sign-in page opens: enter the Odoo login and the Odoo API key.
+4. In the connector's tool permissions, keep every change tool on **Needs approval**.
+
+## Operations
+
+* **Cut off access instantly:** delete the API key in Odoo (*My Preferences → Account Security*).
+* **See logs:** Vercel → project → Logs. Every tool call is a JSON line with `"event": "odoo_mcp_call"`.
+* **Revoke the sign-in from your laptop:** with `REDIS_URL` set to the Upstash URL in your shell, run
+  `python -m sahajta_odoo_mcp.oauth.admin list` / `revoke --login shubhangsethi@gmail.com`.
+* **Switch to read-write:** set `MCP_ACCESS_MODE=read_write`, redeploy, then reconnect in Claude so it sees the
+  new tools.

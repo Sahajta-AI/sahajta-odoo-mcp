@@ -1,0 +1,164 @@
+"""Builds the MCP server in its two modes.
+
+stdio : one person, credentials from environment variables (Claude Desktop / Claude Code on a laptop).
+http  : company-wide Claude connector; every person signs in with their own Odoo API key (OAuth).
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from urllib.parse import urlparse
+
+import httpx
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+from . import __version__
+from .audit import AuditLog
+from .config import Settings
+from .confirm import ConfirmationSigner
+from .errors import OdooError
+from .odoo_client import OdooClient, OdooCredentials, new_http_client
+from .policy import SafetyPolicy
+from .ratelimit import RateLimiter
+from .schema import SchemaCache
+from .service import OdooService, Shared
+from .state import MemoryState, RedisState, redis_client
+from .tools import INSTRUCTIONS, register_tools
+
+SERVER_NAME = "sahajta-odoo"
+SERVER_TITLE = "Sahajta Odoo"
+_SERVICE_TTL_SECONDS = 600
+
+
+def build_shared(settings: Settings, secret: bytes, http: httpx.AsyncClient | None = None) -> Shared:
+    state = RedisState(redis_client(settings.mcp_redis_url.get_secret_value())) if settings.mcp_redis_url else MemoryState()
+    return Shared(
+        settings=settings,
+        policy=SafetyPolicy(settings),
+        schema=SchemaCache(),
+        signer=ConfirmationSigner(secret, state=state),
+        audit=AuditLog(settings.mcp_audit_log_file),
+        limiter=RateLimiter(settings.mcp_reads_per_minute, settings.mcp_writes_per_minute, state=state),
+        http=http or new_http_client(verify=settings.odoo_verify_tls),
+        button_cache={},
+    )
+
+
+def _new_server(**auth_kwargs) -> MCPServer:
+    return MCPServer(
+        name=SERVER_NAME,
+        title=SERVER_TITLE,
+        description="Read and (if enabled) safely update Odoo ERP data. Records can never be deleted.",
+        instructions=INSTRUCTIONS,
+        version=__version__,
+        **auth_kwargs,
+    )
+
+
+def create_stdio_server(settings: Settings, http: httpx.AsyncClient | None = None) -> MCPServer:
+    settings.require_stdio_settings()
+    secret = settings.mcp_secret.get_secret_value().encode() if settings.mcp_secret else os.urandom(32)
+    shared = build_shared(settings, secret, http)
+    client = OdooClient(
+        OdooCredentials(settings.odoo_url, settings.odoo_db, settings.odoo_login or "", settings.odoo_api_key.get_secret_value()),
+        shared.http,
+        protocol=settings.odoo_protocol,
+        timeout=settings.odoo_timeout_seconds,
+        max_parallel=settings.odoo_max_parallel_requests,
+    )
+    holder: dict[str, OdooService] = {}
+
+    async def get_service() -> OdooService:
+        if "service" not in holder:
+            identity = await client.identity()
+            if not identity.is_internal_user:
+                raise ToolError("This Odoo account is a portal/customer account; use an internal employee account.")
+            holder["service"] = OdooService(shared, client, identity)
+        return holder["service"]
+
+    mcp = _new_server()
+    register_tools(mcp, get_service, settings)
+    return mcp
+
+
+def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
+    """Returns the ASGI app for the company-wide connector."""
+    from .oauth import build_oauth  # imported lazily: stdio mode does not need it
+
+    settings.require_http_settings()
+    shared = build_shared(settings, settings.mcp_secret.get_secret_value().encode(), http)
+    oauth = build_oauth(settings, shared.http)
+    services: OrderedDict[str, tuple[float, OdooService]] = OrderedDict()
+
+    async def get_service() -> OdooService:
+        token = get_access_token()
+        if token is None:
+            raise ToolError("Not signed in. Reconnect the Odoo connector in Claude.")
+        key = str((token.claims or {}).get("grant_id") or token.token)
+        now = time.monotonic()
+        hit = services.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+        try:
+            creds = oauth.credentials_for(token)
+            client = OdooClient(
+                creds, shared.http, protocol=settings.odoo_protocol, timeout=settings.odoo_timeout_seconds,
+                max_parallel=settings.odoo_max_parallel_requests,
+            )
+            identity = await client.identity()
+        except OdooError as exc:
+            if exc.kind == "auth":
+                # The Odoo key was revoked or expired: end this sign-in so Claude asks the person to reconnect.
+                oauth.revoke(token, "Odoo rejected the API key")
+            raise ToolError(f"{exc}. Reconnect the Odoo connector in Claude.") from exc
+        if not identity.is_internal_user:
+            raise ToolError("This Odoo account is a portal/customer account and cannot use this connector.")
+        service = OdooService(shared, client, identity)
+        services[key] = (now + _SERVICE_TTL_SECONDS, service)
+        while len(services) > 500:
+            services.popitem(last=False)
+        return service
+
+    mcp = _new_server(token_verifier=oauth.token_verifier, auth=oauth.auth_settings)
+    register_tools(mcp, get_service, settings)
+    for route in oauth.routes:
+        mcp.custom_route(route.path, methods=sorted(route.methods or ["GET"]), name=route.name)(route.endpoint)
+
+    @mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
+    async def healthz(_: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok", "version": __version__})
+
+    host = urlparse(settings.mcp_public_url).netloc
+    transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[host, f"{host.split(':')[0]}:*"],
+        allowed_origins=[f"https://{host}", "https://claude.ai", "https://claude.com"],
+    )
+    app = mcp.streamable_http_app(
+        streamable_http_path="/mcp",
+        stateless_http=True,
+        json_response=True,
+        transport_security=transport_security,
+        host=settings.mcp_host,
+    )
+    inner_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(starlette_app):
+        async with inner_lifespan(starlette_app):
+            try:
+                yield
+            finally:
+                await oauth.aclose()
+                await shared.http.aclose()
+
+    app.router.lifespan_context = lifespan
+    return app

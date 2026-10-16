@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.venv
+data
+tests
+docs/signin-page.jpg
+Dockerfile
+docker-compose.yml
+.dockerignore
+*.sqlite3*
+__pycache__
+.pytest_cache

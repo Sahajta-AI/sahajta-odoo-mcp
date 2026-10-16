@@ -1,0 +1,35 @@
+# One small VM is enough. Caddy obtains the HTTPS certificate automatically.
+# 1. Point a DNS A record (e.g. odoo-mcp.sahajta.ai) at the VM's public IPv4 address.
+# 2. cp .env.example .env  and fill it in (MCP_PUBLIC_URL must match the domain below).
+# 3. DOMAIN=odoo-mcp.sahajta.ai docker compose up -d
+services:
+  mcp:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - mcp-data:/data
+    expose:
+      - "8000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  caddy:
+    image: caddy:2.10
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN to the public host name}
+    command: caddy reverse-proxy --from ${DOMAIN} --to mcp:8000
+    volumes:
+      - caddy-data:/data
+    depends_on: [mcp]
+
+volumes:
+  mcp-data:
+  caddy-data:
