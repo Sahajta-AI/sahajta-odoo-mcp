@@ -84,6 +84,7 @@ class Shared:
     http: httpx.AsyncClient
     button_cache: dict
     state: object = None  # shared cache / single-use / rate-limit store (Redis on serverless)
+    usage: object = None  # 30-day usage history (Redis only)
 
 
 class OdooService:

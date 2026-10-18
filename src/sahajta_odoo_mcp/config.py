@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     mcp_host: str = "0.0.0.0"
     mcp_port: int = 8000
     mcp_secret: SecretStr | None = Field(default=None, description="Long random secret used to sign and encrypt tokens.")
+    mcp_admin_token: SecretStr | None = Field(
+        default=None, description="Bearer token for GET /admin/usage (usage report). Unset = report disabled."
+    )
     mcp_data_dir: str = "./data"
     mcp_allowed_redirect_uris: CsvList = Field(default_factory=lambda: list(DEFAULT_REDIRECT_URIS))
     mcp_allowed_login_domains: CsvList = Field(

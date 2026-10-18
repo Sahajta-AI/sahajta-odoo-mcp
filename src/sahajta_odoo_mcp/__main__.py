@@ -3,6 +3,7 @@
   sahajta-odoo-mcp stdio    run for one person (Claude Desktop / Claude Code), credentials from env
   sahajta-odoo-mcp http     run the company-wide connector (OAuth sign-in per person)
   sahajta-odoo-mcp check    test the Odoo connection and print the active safety settings
+  sahajta-odoo-mcp usage    usage report of the deployed connector (needs MCP_PUBLIC_URL + MCP_ADMIN_TOKEN)
 """
 
 from __future__ import annotations
@@ -28,7 +29,9 @@ def _settings() -> Settings:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="sahajta-odoo-mcp", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("mode", choices=["stdio", "http", "check"])
+    parser.add_argument("mode", choices=["stdio", "http", "check", "usage"])
+    parser.add_argument("--days", type=int, default=7, help="usage: how many days to cover (1-30)")
+    parser.add_argument("--json", action="store_true", help="usage: print raw JSON")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = _settings()
@@ -54,8 +57,33 @@ def main(argv: list[str] | None = None) -> None:
             # Exactly one process: single-use confirm tokens, rate limits and caches live in memory.
             workers=1,
         )
+    elif args.mode == "usage":
+        _usage(settings, args.days, args.json)
     else:
         asyncio.run(_check(settings))
+
+
+def _usage(settings: Settings, days: int, as_json: bool) -> None:
+    import httpx
+
+    from .usage import format_report
+
+    if not settings.mcp_public_url or not settings.mcp_admin_token:
+        raise SystemExit("Set MCP_PUBLIC_URL and MCP_ADMIN_TOKEN (in .env) to read the usage report.")
+    url = f"{settings.mcp_public_url.rstrip('/')}/admin/usage"
+    try:
+        response = httpx.get(
+            url,
+            params={"days": days},
+            headers={"Authorization": f"Bearer {settings.mcp_admin_token.get_secret_value()}"},
+            timeout=30,
+        )
+    except httpx.HTTPError as exc:
+        raise SystemExit(f"Could not reach {url} ({type(exc).__name__}). Check MCP_PUBLIC_URL in .env.") from None
+    if response.status_code != 200:
+        raise SystemExit(f"Usage report unavailable: HTTP {response.status_code} {response.text[:200]}")
+    report = response.json()
+    print(json.dumps(report, indent=2) if as_json else format_report(report))
 
 
 async def _check(settings: Settings) -> None:

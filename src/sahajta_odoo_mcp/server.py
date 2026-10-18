@@ -6,6 +6,8 @@ http  : company-wide Claude connector; every person signs in with their own Odoo
 
 from __future__ import annotations
 
+import asyncio
+import hmac
 import os
 import time
 from collections import OrderedDict
@@ -31,6 +33,7 @@ from .ratelimit import RateLimiter
 from .schema import SchemaCache
 from .service import OdooService, Shared
 from .state import MemoryState, RedisState, redis_client
+from .usage import UsageLog
 from .tools import INSTRUCTIONS, register_tools
 
 SERVER_NAME = "sahajta-odoo"
@@ -39,17 +42,20 @@ _SERVICE_TTL_SECONDS = 600
 
 
 def build_shared(settings: Settings, secret: bytes, http: httpx.AsyncClient | None = None) -> Shared:
-    state = RedisState(redis_client(settings.mcp_redis_url.get_secret_value())) if settings.mcp_redis_url else MemoryState()
+    redis_conn = redis_client(settings.mcp_redis_url.get_secret_value()) if settings.mcp_redis_url else None
+    state = RedisState(redis_conn) if redis_conn is not None else MemoryState()
+    usage = UsageLog(redis_conn) if redis_conn is not None else None
     return Shared(
         settings=settings,
         policy=SafetyPolicy(settings),
         schema=SchemaCache(shared=state),
         signer=ConfirmationSigner(secret, state=state),
-        audit=AuditLog(settings.mcp_audit_log_file),
+        audit=AuditLog(settings.mcp_audit_log_file, usage=usage),
         limiter=RateLimiter(settings.mcp_reads_per_minute, settings.mcp_writes_per_minute, state=state),
         http=http or new_http_client(verify=settings.odoo_verify_tls),
         button_cache={},
         state=state,
+        usage=usage,
     )
 
 
@@ -120,6 +126,10 @@ def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
             )
             identity = await client.identity()
         except OdooError as exc:
+            shared.audit.record(
+                user=str((token.claims or {}).get("login", "?")), uid=None, tool="connect", outcome="error",
+                detail=f"{exc.kind}: {exc}",
+            )
             if exc.kind == "auth":
                 # The Odoo key was revoked or expired: end this sign-in so Claude asks the person to reconnect.
                 oauth.revoke(token, "Odoo rejected the API key")
@@ -136,6 +146,23 @@ def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
     register_tools(mcp, get_service, settings)
     for route in oauth.routes:
         mcp.custom_route(route.path, methods=sorted(route.methods or ["GET"]), name=route.name)(route.endpoint)
+
+    @mcp.custom_route("/admin/usage", methods=["GET"], include_in_schema=False)
+    async def admin_usage(request: Request) -> JSONResponse:
+        """Usage report for the operator. Needs MCP_ADMIN_TOKEN as a bearer token; 404 when disabled."""
+        expected = settings.mcp_admin_token.get_secret_value() if settings.mcp_admin_token else ""
+        if not expected or shared.usage is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        header = request.headers.get("authorization", "")
+        supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        if not hmac.compare_digest(supplied.encode(), expected.encode()):
+            return JSONResponse({"error": "unauthorized"}, status_code=401, headers={"WWW-Authenticate": 'Bearer realm="admin"'})
+        try:
+            days = max(1, min(int(request.query_params.get("days", "7")), 30))
+        except ValueError:
+            return JSONResponse({"error": "days must be a number from 1 to 30"}, status_code=400)
+        report = await asyncio.to_thread(shared.usage.report, days)
+        return JSONResponse(report, headers={"Cache-Control": "no-store"})
 
     @mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
     async def healthz(_: Request) -> JSONResponse:

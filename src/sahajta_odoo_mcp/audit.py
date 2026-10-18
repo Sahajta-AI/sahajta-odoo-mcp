@@ -12,8 +12,9 @@ _logger = logging.getLogger("sahajta_odoo_mcp.audit")
 
 
 class AuditLog:
-    def __init__(self, file_path: str | None = None):
+    def __init__(self, file_path: str | None = None, usage=None):
         self._file = file_path
+        self._usage = usage  # optional 30-day history in Redis (see usage.py)
         if not _logger.handlers:
             handler = logging.StreamHandler(sys.stderr)  # never stdout: stdio mode uses it for the protocol
             handler.setFormatter(logging.Formatter("%(message)s"))
@@ -52,6 +53,8 @@ class AuditLog:
             entry["method"] = method
         if detail:
             entry["detail"] = detail[:300]
+        if self._usage is not None:
+            self._usage.record(entry)
         line = json.dumps(entry, default=str)
         _logger.info(line)
         if self._file:
