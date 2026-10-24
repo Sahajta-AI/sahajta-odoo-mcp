@@ -23,7 +23,7 @@ from .confirm import ConfirmationSigner
 from .errors import OdooError, OdooMCPError, PolicyViolation, ValidationFailed
 from .formatting import UNTRUSTED_NOTE, Formatter
 from .odoo_client import OdooClient, OdooIdentity
-from .policy import SafetyPolicy, is_sensitive_field
+from .policy import CREATE_ONLY_FIELDS, SafetyPolicy, is_sensitive_field
 from .ratelimit import RateLimiter
 from .schema import SchemaCache
 from .validation import Validator, user_zone
@@ -372,9 +372,9 @@ class OdooService:
                 if write_block:
                     entry["ai_can_write"] = False
                 else:
-                    reason = self.policy.field_write_block_reason(name, meta)
+                    reason = self.policy.field_write_block_reason(name, meta, model=model)
                     entry["ai_can_write"] = reason is None
-                    if reason and not meta.get("readonly"):
+                    if reason and (not meta.get("readonly") or (model, name) in CREATE_ONLY_FIELDS):
                         entry["why_not"] = reason
                 out_fields.append(entry)
             limit_n = min(limit or 200, 400)

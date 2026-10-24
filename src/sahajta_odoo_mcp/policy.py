@@ -203,6 +203,11 @@ MAGIC_FIELDS: frozenset[str] = frozenset(
 # marked "posted" without journal entries). Use the model's buttons instead.
 WORKFLOW_FIELDS: frozenset[str] = frozenset({"state", "move_type", "payment_state", "invoice_status"})
 
+# (model, field) pairs that pick what a new record is (customer invoice, vendor bill, credit note, ...).
+# Odoo marks them read-only because its own screens set them on create (the record always starts in
+# draft); they may be set on create here too, but never changed afterwards.
+CREATE_ONLY_FIELDS: frozenset[tuple[str, str]] = frozenset({("account.move", "move_type")})
+
 # Field types the AI can never write: files, and free-form JSON whose changes a preview can't show clearly.
 UNWRITABLE_TYPES: frozenset[str] = frozenset({"binary", "image", "properties", "properties_definition", "json"})
 
@@ -432,17 +437,23 @@ class SafetyPolicy:
 
     # -- fields -----------------------------------------------------------------------
 
-    def field_write_block_reason(self, name: str, meta: dict) -> str | None:
+    def field_write_block_reason(
+        self, name: str, meta: dict, *, model: str | None = None, creating: bool = False
+    ) -> str | None:
         if is_sensitive_field(name):
             return "looks like a credential or secret"
         if name in MAGIC_FIELDS:
             return "is maintained automatically by Odoo"
-        if name in WORKFLOW_FIELDS:
+        create_only = (model, name) in CREATE_ONLY_FIELDS
+        if create_only:
+            if not creating:
+                return "can be set only when the record is created (e.g. move_type='out_invoice'), never changed afterwards"
+        elif name in WORKFLOW_FIELDS:
             return "is a workflow status; use odoo_list_actions and run the matching button instead"
         ftype = meta.get("type")
         if ftype in UNWRITABLE_TYPES:
             return f"is a {ftype} field, which this server never writes (a person can edit it in Odoo)"
-        if meta.get("readonly"):
+        if meta.get("readonly") and not create_only:
             return "is read-only in Odoo"
         if ftype in ("one2many", "many2many", "many2one", "reference") and meta.get("relation"):
             reason = self.model_read_block_reason(meta["relation"])

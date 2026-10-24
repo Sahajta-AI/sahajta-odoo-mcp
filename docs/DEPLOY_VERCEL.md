@@ -23,6 +23,9 @@ so Redis is required; the app refuses to start without it.
 | `MCP_SECRET` | random 48+ characters (sensitive). Changing it signs everyone out |
 | `MCP_ALLOWED_LOGINS` | `person@example.com`: the only Odoo login that may connect |
 | `MCP_ACCESS_MODE` | `read_only` to start; `read_write` to allow changes (with preview + approval) |
+| `MCP_ALLOW_OUTBOUND_MESSAGES` | `true` lets Claude send e-mails and press "Send" buttons (with preview + approval). Default `false` |
+| `MCP_ALLOW_ARCHIVE` | `true` lets Claude archive and unarchive records (with preview + approval). Default `false` |
+| `MCP_ALLOW_CANCEL_ACTIONS` | `true` lets Claude press cancel / reset to draft / mark lost buttons (with approval). Default `false` |
 | `MCP_TRUST_PROXY_HEADERS` | `true` |
 | `MCP_ADMIN_TOKEN` | random 40+ characters (sensitive): unlocks the usage report |
 | `REDIS_URL` / `KV_URL` | set automatically when Upstash Redis is connected to the project |
@@ -52,4 +55,5 @@ After changing a variable, redeploy for it to take effect.
 * **Revoke the sign-in from your laptop:** with `REDIS_URL` set to the Upstash URL in your shell, run
   `python -m sahajta_odoo_mcp.oauth.admin list` / `revoke --login person@example.com`.
 * **Switch to read-write:** set `MCP_ACCESS_MODE=read_write`, redeploy, then reconnect in Claude so it sees the
-  new tools.
+  new tools. Do the same after you change `MCP_ALLOW_OUTBOUND_MESSAGES` (it adds or removes the e-mail tools).
+* **Delete:** no setting allows it. Use archive instead: archived records can be restored.

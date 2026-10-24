@@ -59,7 +59,9 @@ accounting lock dates.
 **Fields**: anything named like a password, secret, token, API key, private key, TOTP/OTP, credential, passkey,
 signup, PIN, passphrase or hash is stripped from every answer and cannot be searched, sorted, grouped or
 written. Fields that point to a blocked model can't be read, searched or grouped on either. `state`, `move_type`,
-`payment_state` and `invoice_status` can't be written directly (use the real buttons). Read-only fields,
+`payment_state` and `invoice_status` can't be written directly (use the real buttons). One exception: an invoice's
+`move_type` (customer invoice, vendor bill, credit note) can be set when the invoice is created, which always
+creates it in draft; it can't be changed afterwards. Read-only fields,
 binary/file fields, and audit fields (`create_uid`, `write_date`, …) can't be written. `active` (archiving) only
 with `MCP_ALLOW_ARCHIVE=true`.
 

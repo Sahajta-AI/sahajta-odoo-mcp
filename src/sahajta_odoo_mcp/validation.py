@@ -208,7 +208,7 @@ class Validator:
             if inverse and name == inverse:
                 problems.append(f"{model}.{name} is set automatically from the parent record; leave it out")
                 continue
-            reason = self.policy.field_write_block_reason(name, meta)
+            reason = self.policy.field_write_block_reason(name, meta, model=model, creating=mode == "create")
             if reason:
                 problems.append(f"{model}.{name} {reason}")
                 continue

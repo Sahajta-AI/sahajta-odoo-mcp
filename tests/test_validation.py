@@ -603,6 +603,26 @@ async def test_one2many_on_create(v):
     assert out == {"partner_id": 1, "order_line": [[0, 0, {"product_id": 10}]]}
 
 
+async def test_invoice_type_is_accepted_on_create_and_refused_on_update(fake):
+    selection = [["entry", "Journal Entry"], ["out_invoice", "Customer Invoice"], ["in_invoice", "Vendor Bill"]]
+    fake.schema["account.move"] = {
+        "move_type": {"type": "selection", "string": "Type", "selection": selection, "store": True, "readonly": True},
+        "state": {"type": "selection", "string": "Status", "selection": [["draft", "Draft"], ["posted", "Posted"]],
+                  "store": True, "readonly": False},
+        "partner_id": {"type": "many2one", "string": "Customer", "relation": "res.partner", "store": True, "readonly": False},
+    }
+    fake.records["account.move"] = {5: {"name": "INV/2026/00001"}}
+    v = make_validator(fake)
+    out = await v.normalize_values("account.move", {"move_type": "out_invoice", "partner_id": 1}, mode="create")
+    assert out == {"move_type": "out_invoice", "partner_id": 1}
+    await rejected(v.normalize_values("account.move", {"move_type": "out_refund"}, mode="create"), "move_type")
+    await rejected(
+        v.normalize_values("account.move", {"move_type": "in_invoice"}, mode="write", record_ids=[5]),
+        "only when the record is created",
+    )
+    await rejected(v.normalize_values("account.move", {"state": "posted"}, mode="create"), "workflow status")
+
+
 async def test_one2many_nested_values_are_validated_and_refs_checked(v):
     await rejected(
         v.normalize_values("sale.order", {"order_line": [{"product_id": 999}]}, mode="write", record_ids=[5]),

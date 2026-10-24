@@ -7,6 +7,7 @@ import pytest
 from conftest import build_settings
 from sahajta_odoo_mcp.errors import PolicyViolation
 from sahajta_odoo_mcp.policy import (
+    CREATE_ONLY_FIELDS,
     HARD_BLOCKED_MODELS,
     MAGIC_FIELDS,
     WORKFLOW_FIELDS,
@@ -322,6 +323,22 @@ def test_sensitive_field_false_negatives(name):
 @pytest.mark.parametrize("name", sorted(WORKFLOW_FIELDS))
 def test_workflow_fields_are_never_writable(name, everything_on):
     assert "workflow" in everything_on.field_write_block_reason(name, {"type": "selection"})
+    assert "workflow" in everything_on.field_write_block_reason(name, {"type": "selection"}, creating=True)
+    # move_type is create-only on invoices, nowhere else (e.g. the related copy on invoice lines)
+    assert "workflow" in everything_on.field_write_block_reason(
+        name, {"type": "selection"}, model="account.move.line", creating=True
+    )
+
+
+def test_invoice_type_is_set_on_create_only(everything_on):
+    meta = {"type": "selection", "readonly": True}  # Odoo marks it read-only: its screens set it on create
+    assert ("account.move", "move_type") in CREATE_ONLY_FIELDS
+    assert everything_on.field_write_block_reason("move_type", meta, model="account.move", creating=True) is None
+    assert "only when the record is created" in everything_on.field_write_block_reason(
+        "move_type", meta, model="account.move"
+    )
+    # other models' read-only fields stay read-only on create
+    assert "read-only" in everything_on.field_write_block_reason("amount_total", meta, model="account.move", creating=True)
 
 
 @pytest.mark.parametrize("name", sorted(MAGIC_FIELDS))
