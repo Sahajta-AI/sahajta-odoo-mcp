@@ -33,7 +33,7 @@ def make_settings(**overrides) -> Settings:
         mcp_audit_log_file=None,
     )
     values.update(overrides)
-    return Settings(**values)
+    return Settings(_env_file=None, **values)  # never pick up the local .env (production values)
 
 
 async def call(client: Client, tool: str, **args):

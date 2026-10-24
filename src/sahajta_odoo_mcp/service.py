@@ -579,7 +579,8 @@ class OdooService:
                     "'visible_when_not' is Odoo's condition that HIDES the button; the button only applies to records "
                     "where that condition is false.",
                     "Wizard actions open a dialog model: create a record of 'opens_model' with odoo_create using "
-                    "context {active_model, active_ids}, then run that wizard's own button.",
+                    "context {active_model, active_ids} (values may be {} if the dialog needs no input; if it has a "
+                    "field pointing at those records, e.g. lead_ids, set it too), then run that wizard's own button.",
                 ],
             }
 
@@ -656,9 +657,46 @@ class OdooService:
             raise ValidationFailed(f"too many records at once; the limit is {self.settings.mcp_max_write_records}")
         ctx = self.policy.sanitize_context(context)
         await self._context_defaults_check(model, ctx)
-        normalized = [await self.validator.normalize_values(model, values, mode="create") for values in records]
+        normalized = []
+        for values in records:
+            # a dialog opened from records may need no input at all: Odoo fills it from the context
+            if ctx.get("active_model") and values == {}:
+                normalized.append({})
+            else:
+                normalized.append(await self.validator.normalize_values(model, values, mode="create"))
+        await self._check_wizard_link(model, normalized, ctx)
         payload = {"op": "create", "who": self.user_key, "model": model, "values": normalized, "context": ctx}
         return normalized, ctx, payload
+
+    async def _check_wizard_link(self, model: str, records: list[dict], ctx: dict) -> None:
+        """A dialog opened from records must point at them, or its button does nothing and still "succeeds".
+
+        Odoo's buttons often pass the records through the window action's own context (e.g. default_lead_ids
+        for "Mark as Lost"), which this server does not replay. So when the dialog has fields pointing at the
+        active model, at least one must get a value, from the AI or from Odoo's defaults for this context.
+        """
+        source = ctx.get("active_model")
+        ids = ctx.get("active_ids") or ([ctx["active_id"]] if ctx.get("active_id") else [])
+        if not source or not ids:
+            return
+        fields = await self._fields(model)
+        links = [
+            n for n, m in fields.items()
+            if m.get("type") in ("many2one", "many2many") and m.get("relation") == source and not m.get("readonly")
+        ]
+        if not links or all(any(values.get(n) for n in links) for values in records):
+            return
+        try:
+            defaults = await self.client.call(model, "default_get", fields=links, context=ctx)
+        except OdooError:
+            return
+        if any((defaults or {}).get(n) for n in links):
+            return
+        example = ", ".join(f'"{n}": {ids if fields[n]["type"] == "many2many" else ids[0]}' for n in links)
+        raise ValidationFailed(
+            f"this {model} would not be linked to the {source} records in active_ids, so its button would do "
+            f"nothing. Set the link in the values, e.g. {{{example}}}"
+        )
 
     async def preview_create(self, model: str, records: Any, context: Any) -> dict:
         async with self._op("odoo_preview_create", "read", model=model):

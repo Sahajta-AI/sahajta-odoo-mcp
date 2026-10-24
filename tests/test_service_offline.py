@@ -200,6 +200,41 @@ async def test_create_with_wizard_context(svc, fake):
     assert fake.calls_to("create")[0].context == ctx
 
 
+LOST_WIZARD = {
+    "lead_ids": {"type": "many2many", "string": "Leads", "relation": "crm.lead", "store": True, "readonly": False},
+    "lost_feedback": {"type": "text", "string": "Closing Note", "store": True, "readonly": False},
+}
+
+
+async def test_wizard_not_linked_to_its_records_is_refused(svc, fake):
+    # "Mark as Lost" gets its leads from the window action's context; without them it silently does nothing
+    fake.schema["crm.lead.lost"] = LOST_WIZARD
+    ctx = {"active_model": "crm.lead", "active_ids": [100]}
+    with pytest.raises(ValidationFailed, match=r'"lead_ids": \[100\]'):
+        await svc.preview_create("crm.lead.lost", [{"lost_feedback": "too expensive"}], ctx)
+    with pytest.raises(ValidationFailed, match="lead_ids"):
+        await svc.preview_create("crm.lead.lost", [{}], ctx)
+    preview = await svc.preview_create("crm.lead.lost", [{"lead_ids": [100]}], ctx)
+    await svc.create("crm.lead.lost", [{"lead_ids": [100]}], ctx, preview["confirm_token"])
+    assert changes(fake) == ["crm.lead.lost.create"]
+
+
+async def test_wizard_linked_by_odoo_defaults_needs_no_values(svc, fake):
+    fake.schema["crm.lead.lost"] = LOST_WIZARD
+    fake.defaults["crm.lead.lost"] = {"lead_ids": [[6, 0, [100]]]}
+    ctx = {"active_model": "crm.lead", "active_ids": [100]}
+    preview = await svc.preview_create("crm.lead.lost", [{}], ctx)
+    await svc.create("crm.lead.lost", [{}], ctx, preview["confirm_token"])
+    assert fake.calls_to("create")[0].kwargs["vals_list"] == [{}]
+
+
+async def test_empty_values_need_a_wizard_context(svc, fake):
+    with pytest.raises(ValidationFailed, match="non-empty"):
+        await svc.preview_create("crm.tag", [{}], None)
+    preview = await svc.preview_create("crm.tag", [{}], {"active_model": "sale.order", "active_ids": [5]})
+    assert preview["records"] == [{}]
+
+
 async def test_create_preview_warns_about_missing_required_fields(svc, fake):
     preview = await svc.preview_create("crm.lead", [{"partner_id": 1}], None)
     assert any("Opportunity (name)" in w and "Type (type)" in w for w in preview["warnings"])
