@@ -33,7 +33,7 @@ from sahajta_odoo_mcp.errors import (
     StateUnavailable,
 )
 from sahajta_odoo_mcp.ratelimit import RateLimiter
-from sahajta_odoo_mcp.state import MemoryState, RedisState
+from sahajta_odoo_mcp.state import MemoryState, RedisState, SQLiteState
 from test_service_offline import LEAD, changes, make_service, make_shared
 
 pytestmark = pytest.mark.usefixtures("no_unlink_ever")
@@ -419,6 +419,30 @@ def test_release_makes_a_claim_available_again(state):
 
 def test_release_reports_when_the_store_is_down():
     assert RedisState(DownRedis()).release("k") is False
+
+
+def test_sqlite_claims_survive_a_restart_until_they_expire(tmp_path):
+    # one container without Redis: an approval whose change may have reached Odoo stays used after a restart
+    path = tmp_path / "data" / "claims.sqlite3"
+    key = "confirm:1999999999.a-confirm-token"
+    first = SQLiteState(path)
+    assert first.claim_once(key, 2_000_000_000) is True
+    assert first.claim_once("old", 1) is True  # expires at once
+    first.close()
+    second = SQLiteState(path)
+    assert second.claim_once(key, 2_000_000_000) is False
+    assert second.claim_once("old", 2_000_000_000) is True
+    assert second.release(key) is True and second.claim_once(key, 2_000_000_000) is True
+    second.close()
+    assert b"a-confirm-token" not in path.read_bytes()  # only a digest of the token is stored
+
+
+def test_a_sqlite_claim_that_cannot_be_recorded_stops_the_change(tmp_path):
+    state = SQLiteState(tmp_path / "claims.sqlite3")
+    state.close()
+    with pytest.raises(StateUnavailable, match="Nothing was changed"):
+        state.claim_once("k", 2_000_000_000)
+    assert state.release("k") is False
 
 
 async def test_a_change_is_not_sent_when_its_approval_cannot_be_recorded(fake):

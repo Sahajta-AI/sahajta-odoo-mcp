@@ -16,6 +16,7 @@ import email.utils
 import hashlib
 import http.cookiejar
 import itertools
+import logging
 import random
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -23,9 +24,11 @@ from typing import Any
 
 import httpx
 
-from . import __version__
+from . import __version__, deadline
 from .errors import OdooError
 from .policy import HARD_BLOCKED_MODELS, HARD_BLOCKED_PREFIXES
+
+logger = logging.getLogger(__name__)
 
 USER_AGENT = f"sahajta-odoo-mcp/{__version__}"
 
@@ -44,6 +47,8 @@ _SAFE_TO_RETRY = frozenset(
 _RETRY_WAITS = (2.0, 4.0)
 _MAX_WAIT = 8.0
 _MAX_TOTAL_WAIT = 15.0
+# Near the end of a tool call each request still gets this long, so a quick answer can arrive.
+_MIN_TIMEOUT = 5.0
 # Odoo Online's acceptable-use policy asks for throttled, non-parallel API calls; all users of one
 # Odoo share these gates.
 _GATES: dict[tuple[str, int, int], asyncio.Semaphore] = {}
@@ -137,6 +142,11 @@ class OdooClient:
     def protocol(self) -> str:
         return self._protocol
 
+    def _request_timeout(self) -> float:
+        """The configured timeout, cut to the time left in the current tool call (never below _MIN_TIMEOUT)."""
+        left = deadline.seconds_left()
+        return self._timeout if left is None else min(self._timeout, max(_MIN_TIMEOUT, left))
+
     # ------------------------------------------------------------------ public API
 
     async def call(
@@ -161,12 +171,16 @@ class OdooClient:
         for attempt in itertools.count(1):
             try:
                 async with _gate(self.creds.url, self._max_parallel):
+                    # A change may wait here behind other calls; once its send-by time has passed it must not go
+                    # out, or the platform could cut the request off half-way.
+                    if deadline.send_by_passed():
+                        raise OdooError("the change waited too long for its turn", kind="late", maybe_applied=False)
                     if self._protocol == "json2":
                         return await self._call_json2(model, method, ids=ids, context=context, kwargs=kwargs)
                     return await self._call_jsonrpc(model, method, ids=ids, context=context, kwargs=kwargs)
             except OdooError as exc:
                 wait = _retry_wait(exc, attempt, waited) if method in _SAFE_TO_RETRY else None
-                if wait is None:
+                if wait is None or not _fits_in_call(wait):
                     raise
                 await asyncio.sleep(wait)
                 waited += wait
@@ -200,11 +214,13 @@ class OdooClient:
             uid = ctx.get("uid") if isinstance(ctx, dict) else None
             if not isinstance(uid, int):
                 uid = self._uid
+            # Odoo accepted the key (HTTP 200) but the answer is odd, e.g. a proxy's error page: that says
+            # nothing about the key, so it must never be taken as "the key is invalid".
             if not isinstance(uid, int):
-                raise OdooError("could not determine which Odoo user this API key belongs to", kind="auth")
+                raise OdooError("Odoo's answer did not say which user this API key belongs to", kind="server", status=200)
             rows = await self.call("res.users", "read", ids=[uid], fields=["login", "name", "share", "company_id"])
             if not rows:
-                raise OdooError("the Odoo user for this API key was not found", kind="auth")
+                raise OdooError("Odoo did not return the user this API key belongs to", kind="server", status=200)
             row = rows[0]
             company = row.get("company_id") or None
             self._base_context = {
@@ -232,7 +248,7 @@ class OdooClient:
 
     async def server_version(self) -> str:
         try:
-            response = await self._http.get(f"{self.creds.url}/web/version", timeout=self._timeout)
+            response = await self._http.get(f"{self.creds.url}/web/version", timeout=self._request_timeout())
             if response.status_code == 200:
                 return str(response.json().get("version", "unknown"))
         except (httpx.HTTPError, ValueError):
@@ -272,7 +288,7 @@ class OdooClient:
                 return
             except OdooError as exc:
                 wait = _retry_wait(exc, attempt, waited)
-                if wait is not None:
+                if wait is not None and _fits_in_call(wait):
                     await asyncio.sleep(wait)
                     waited += wait
                     continue
@@ -281,14 +297,21 @@ class OdooClient:
                 )
                 if not route_missing:
                     raise
+                if not self.creds.db:
+                    # The legacy protocol needs a database name, so falling back could never work; and a
+                    # maintenance page also looks like "no JSON-2". The probe's own error says what happened.
+                    logger.warning("JSON-2 check answered HTTP %s; set ODOO_DB to allow the JSON-RPC fallback", exc.status)
+                    raise
                 self._protocol = "jsonrpc"
                 await self._authenticate_jsonrpc()
                 return
 
     async def _authenticate_jsonrpc(self) -> None:
         if not self.creds.db:
-            # a server setting, not the person's key: never a reason to end their sign-in
-            raise OdooError("ODOO_DB must be set to use the legacy JSON-RPC protocol", kind="config")
+            # a server setting, not the person's key: never a reason to end their sign-in. The setting's name is
+            # for the operator's log only.
+            logger.warning("ODOO_DB must be set to use the legacy JSON-RPC protocol")
+            raise OdooError("the legacy JSON-RPC protocol needs the Odoo database name, which is not set", kind="config")
         uid = await self._jsonrpc("common", "authenticate", [self.creds.db, self.creds.login, self.creds.api_key, {}])
         if not isinstance(uid, int) or not uid:
             raise OdooError(
@@ -322,7 +345,7 @@ class OdooClient:
             headers["X-Odoo-Database"] = self.creds.db
         url = f"{self.creds.url}/json/2/{model}/{method}"
         try:
-            response = await self._http.post(url, json=body, headers=headers, timeout=self._timeout)
+            response = await self._http.post(url, json=body, headers=headers, timeout=self._request_timeout())
         except httpx.HTTPError as exc:
             raise _transport_error(exc, f"{model}.{method}") from exc
         if response.status_code == 200:
@@ -367,7 +390,7 @@ class OdooClient:
                 f"{self.creds.url}/jsonrpc",
                 json=payload,
                 headers={"User-Agent": USER_AGENT},
-                timeout=self._timeout,
+                timeout=self._request_timeout(),
             )
         except httpx.HTTPError as exc:
             raise _transport_error(exc, f"{service}.{method}") from exc
@@ -472,6 +495,13 @@ def _retry_wait(exc: OdooError, attempt: int, waited: float) -> float | None:
         wait = max(wait, exc.retry_after * random.uniform(1.0, 1.3))  # never sooner than Odoo asked
     wait = min(wait, _MAX_WAIT)
     return wait if waited + wait <= _MAX_TOTAL_WAIT else None
+
+
+def _fits_in_call(wait: float) -> bool:
+    """A retry wait must end before the tool call's soft time limit: each request's waits are capped, but
+    several requests in one call add up past the platform's limit."""
+    left = deadline.seconds_left()
+    return left is None or wait <= left
 
 
 def _clean_message(message: str) -> str:

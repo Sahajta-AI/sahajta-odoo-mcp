@@ -2,7 +2,8 @@
 
 In-memory by default (one server process). With Redis configured they are shared by every
 instance, which serverless hosting (Vercel) needs: one approval must work exactly once and
-rate limits must add up across instances.
+rate limits must add up across instances. A single container without Redis keeps its
+single-use markers in SQLite, so they survive a restart.
 """
 
 from __future__ import annotations
@@ -12,9 +13,12 @@ import hashlib
 import json
 import logging
 import secrets
+import sqlite3
+import threading
 import time
 import zlib
 from collections import defaultdict, deque
+from pathlib import Path
 from typing import Protocol
 
 import redis
@@ -86,6 +90,54 @@ class MemoryState:
         return True
 
 
+class SQLiteState(MemoryState):
+    """MemoryState whose single-use markers live in a SQLite file, for one container without Redis.
+
+    An approval whose change may have reached Odoo stays used after a restart, so it can never apply twice.
+    Rate limits and caches stay in memory: losing them on a restart is harmless.
+    """
+
+    def __init__(self, path: Path | str) -> None:
+        super().__init__()
+        path = Path(path)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None, timeout=5.0)
+        self._db.execute("CREATE TABLE IF NOT EXISTS claims (key TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)")
+
+    def claim_once(self, key: str, expires_at: int) -> bool:
+        try:
+            with self._lock:
+                self._db.execute("DELETE FROM claims WHERE expires_at < ?", (int(time.time()),))
+                cursor = self._db.execute(
+                    "INSERT OR IGNORE INTO claims (key, expires_at) VALUES (?, ?)", (_digest(key), expires_at)
+                )
+                return cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            logger.warning("local store unavailable while claiming a single-use marker: %s", type(exc).__name__)
+            raise StateUnavailable(
+                "The server's store did not answer, so this approval could not be recorded. "
+                "Nothing was changed, please try again."
+            ) from exc
+
+    def release(self, key: str) -> bool:
+        try:
+            with self._lock:
+                self._db.execute("DELETE FROM claims WHERE key = ?", (_digest(key),))
+            return True
+        except sqlite3.Error as exc:
+            logger.warning("local store unavailable while releasing a single-use marker: %s", type(exc).__name__)
+            return False
+
+    def close(self) -> None:
+        with self._lock:
+            self._db.close()
+
+
+def _digest(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
 class RedisState:
     def __init__(self, client: redis.Redis, *, prefix: str = "sahajta-odoo-mcp:"):
         self._r = client
@@ -133,7 +185,7 @@ class RedisState:
         return int(count) <= limit
 
     def _once_name(self, key: str) -> str:
-        return f"{self._prefix}once:{hashlib.sha256(key.encode()).hexdigest()}"
+        return f"{self._prefix}once:{_digest(key)}"
 
     def get_json(self, key: str):
         try:
