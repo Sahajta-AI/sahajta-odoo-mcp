@@ -46,7 +46,7 @@ from .clients import (
     is_redirect_allowed,
 )
 from .crypto import DecryptionError, Sealer, hash_token, new_token
-from .store import ExchangeResult, Grant, NewTokens, OAuthStore, PendingAuthorization
+from .store import REFRESH_REUSE_GRACE_SECONDS, ExchangeResult, Grant, NewTokens, OAuthStore, PendingAuthorization
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,9 @@ MAX_REGISTERED_CLIENTS = 20_000
 MAX_STATE_LENGTH = 2048
 MAX_TOKEN_LENGTH = 256
 _CODE_CHALLENGE = re.compile(r"[A-Za-z0-9\-._~]{43,128}")
+
+# Called with (login, reason) after a grant is revoked, so the owners can be told about the sign-out.
+RevokeHook = Callable[[str, str], None]
 
 
 class TemporarilyUnavailable(Exception):
@@ -73,7 +76,7 @@ class StoredAuthCode(AuthorizationCode):
 class StoredRefreshToken(RefreshToken):
     grant_id: str
     token_hash: str
-    rotated: bool = False
+    rotated_at: float | None = None
 
 
 def normalise_url(value: str) -> str | None:
@@ -103,6 +106,7 @@ class OdooAuthProvider(OAuthAuthorizationServerProvider[StoredAuthCode, StoredRe
         *,
         public_url: str,
         clock: Callable[[], float] = time.time,
+        on_revoke: RevokeHook | None = None,
     ):
         self.store = store
         self.issuer = public_url
@@ -117,6 +121,7 @@ class OdooAuthProvider(OAuthAuthorizationServerProvider[StoredAuthCode, StoredRe
         self._refresh_ttl = settings.mcp_refresh_token_ttl_seconds
         self._last_purge = float("-inf")
         self._last_touch: dict[str, float] = {}
+        self._on_revoke = on_revoke or (lambda login, reason: None)
 
     # ------------------------------------------------------------------ clients
 
@@ -312,6 +317,7 @@ class OdooAuthProvider(OAuthAuthorizationServerProvider[StoredAuthCode, StoredRe
         )
         if result is ExchangeResult.REPLAYED:
             logger.warning("Authorization code replayed for grant %s; grant revoked", authorization_code.grant_id)
+            await asyncio.to_thread(self._signed_out, authorization_code.grant_id, "authorization code reused")
             raise TokenError("invalid_grant", "authorization code was already used; the connection has been revoked")
         if result is not ExchangeResult.OK:
             raise TokenError("invalid_grant", "authorization code is invalid or has expired")
@@ -337,14 +343,15 @@ class OdooAuthProvider(OAuthAuthorizationServerProvider[StoredAuthCode, StoredRe
             subject=str(grant.odoo_uid),
             grant_id=grant.grant_id,
             token_hash=stored.token_hash,
-            rotated=stored.rotated_at is not None,
+            rotated_at=stored.rotated_at,
         )
 
     async def exchange_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: StoredRefreshToken, scopes: list[str]
     ) -> OAuthToken:
-        if refresh_token.rotated:
-            # Replay of a retired refresh token: someone else may hold a copy. Kill the whole grant.
+        rotated_at = refresh_token.rotated_at
+        if rotated_at is not None and self._clock() - rotated_at > REFRESH_REUSE_GRACE_SECONDS:
+            # Replay of a long-retired refresh token: someone else may hold a copy. Kill the whole grant.
             logger.warning("Retired refresh token replayed for grant %s; grant revoked", refresh_token.grant_id)
             await self._revoke(refresh_token.grant_id, "refresh token reused")
             raise TokenError("invalid_grant", "refresh token was already used; the connection has been revoked")
@@ -380,10 +387,17 @@ class OdooAuthProvider(OAuthAuthorizationServerProvider[StoredAuthCode, StoredRe
         result = await asyncio.to_thread(
             self.store.rotate_refresh_token, refresh_token.token_hash, now, self._new_tokens(access, new_refresh, now)
         )
-        if result is ExchangeResult.REPLAYED:
-            logger.warning("Concurrent reuse of a refresh token for grant %s; grant revoked", grant.grant_id)
+        if result is ExchangeResult.REUSED:
+            logger.info(
+                "Refresh token for grant %s used again within %d s of its rotation (client retry or parallel "
+                "refresh); issued a new pair",
+                grant.grant_id, REFRESH_REUSE_GRACE_SECONDS,
+            )
+        elif result is ExchangeResult.REPLAYED:
+            logger.warning("Retired refresh token replayed for grant %s; grant revoked", grant.grant_id)
+            await asyncio.to_thread(self._signed_out, grant.grant_id, "refresh token reused", grant.login)
             raise TokenError("invalid_grant", "refresh token was already used; the connection has been revoked")
-        if result is not ExchangeResult.OK:
+        elif result is not ExchangeResult.OK:
             raise TokenError("invalid_grant", "refresh token is invalid or has expired")
         await self.maybe_purge(now)
         return self._token_response(access, new_refresh)
@@ -431,19 +445,42 @@ class OdooAuthProvider(OAuthAuthorizationServerProvider[StoredAuthCode, StoredRe
             await self._revoke(grant_id, "revoked by the client")
 
     def revoke_for_access_token(self, access_token: AccessToken, reason: str) -> bool:
-        grant_id = (access_token.claims or {}).get("grant_id")
+        claims = access_token.claims or {}
+        grant_id = claims.get("grant_id")
         if not isinstance(grant_id, str):
             return False
-        return self.store.revoke_grant(grant_id, reason, self._clock())
+        return self._revoke_now(grant_id, reason, claims.get("login"))
 
     async def _revoke(self, grant_id: str, reason: str) -> None:
-        await asyncio.to_thread(self.store.revoke_grant, grant_id, reason, self._clock())
+        await asyncio.to_thread(self._revoke_now, grant_id, reason)
+
+    def _revoke_now(self, grant_id: str, reason: str, login: str | None = None) -> bool:
+        revoked = self.store.revoke_grant(grant_id, reason, self._clock())
+        if revoked:
+            self._signed_out(grant_id, reason, login)
+        return revoked
+
+    def _signed_out(self, grant_id: str, reason: str, login: str | None = None) -> None:
+        """Reports a revoked grant to the on_revoke hook. Never raises: the revocation already happened."""
+        try:
+            if login is None:
+                grant = self.store.get_grant(grant_id)
+                login = grant.login if grant is not None else "?"
+            self._on_revoke(login, reason)
+        except Exception:
+            logger.exception("Could not report the revocation of grant %s", grant_id)
 
     # ------------------------------------------------------------------ helpers
 
     def _same_odoo(self, grant: Grant) -> bool:
         # Never send an API key to a server other than the one the person entered it for.
-        return grant.odoo_url == self._settings.odoo_url and grant.odoo_db == self._settings.odoo_db
+        settings = self._settings
+        if grant.odoo_url != settings.odoo_url:
+            return False
+        # JSON-2 does not need a database name, so adding or changing ODOO_DB must not end existing sign-ins.
+        if settings.odoo_protocol == "jsonrpc" and grant.odoo_db and settings.odoo_db:
+            return grant.odoo_db == settings.odoo_db
+        return True
 
     def _new_tokens(self, access: str, refresh: str, now: float) -> NewTokens:
         return NewTokens(
@@ -469,13 +506,23 @@ class OdooAuthProvider(OAuthAuthorizationServerProvider[StoredAuthCode, StoredRe
         self._last_touch[grant_id] = now
         if len(self._last_touch) > 50_000:
             self._last_touch.clear()
-        await asyncio.to_thread(self.store.touch_grant, grant_id, now)
+        try:
+            await asyncio.to_thread(self.store.touch_grant, grant_id, now)
+        except Exception as exc:  # only housekeeping: it must not fail the request
+            logger.warning("Could not record the last use of grant %s (%s)", grant_id, type(exc).__name__)
 
     async def maybe_purge(self, now: float) -> None:
         if now - self._last_purge < PURGE_INTERVAL_SECONDS:
             return
         self._last_purge = now
+        await asyncio.to_thread(self.purge, now)
+
+    def purge(self, now: float) -> None:
+        """Deletes expired records and wipes dead grants. Best-effort: never raises."""
         try:
-            await asyncio.to_thread(self.store.purge, now)
+            revoked = self.store.purge(now)
         except Exception:
             logger.exception("Purging expired OAuth records failed")
+            return
+        for grant_id in revoked:
+            self._signed_out(grant_id, "expired")

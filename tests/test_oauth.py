@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import logging
 import re
 import secrets
 import sqlite3
@@ -21,6 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
+import redis
 import respx
 from starlette.testclient import TestClient
 
@@ -32,6 +34,8 @@ from sahajta_odoo_mcp.errors import OdooError
 from sahajta_odoo_mcp.oauth import OAuthComponents, build_oauth
 from sahajta_odoo_mcp.oauth.admin import main as admin_main
 from sahajta_odoo_mcp.oauth.login_page import GENERIC_FAILURE, IP_LIMITED, PORTAL_FAILURE
+from sahajta_odoo_mcp.oauth.redis_store import RedisOAuthStore
+from sahajta_odoo_mcp.oauth.store import REFRESH_REUSE_GRACE_SECONDS, OAuthStore
 
 PUBLIC = "https://mcp.example.com"
 RESOURCE = f"{PUBLIC}/mcp"
@@ -104,6 +108,7 @@ class Env:
     router: respx.MockRouter
     settings: Settings
     data_dir: Path
+    signouts: list[tuple[str, str]] = field(default_factory=list)  # (login, reason) per revoked grant
 
     @property
     def db_path(self) -> Path:
@@ -137,7 +142,8 @@ def make_env(tmp_path: Path) -> Iterator[Callable[..., Env]]:
         router.start()
         cleanups.append(router.stop)
         odoo = FakeOdoo(router)
-        oauth = build_oauth(settings, httpx.AsyncClient())
+        signouts: list[tuple[str, str]] = []
+        oauth = build_oauth(settings, httpx.AsyncClient(), on_revoke=lambda login, reason: signouts.append((login, reason)))
         cleanups.append(lambda: asyncio.run(oauth.aclose()))
 
         mcp = MCPServer("odoo-test", token_verifier=oauth.token_verifier, auth=oauth.auth_settings)
@@ -161,7 +167,7 @@ def make_env(tmp_path: Path) -> Iterator[Callable[..., Env]]:
         client = TestClient(app, base_url=PUBLIC, follow_redirects=False)
         client.__enter__()
         cleanups.append(lambda: client.__exit__(None, None, None))
-        return Env(client, oauth, odoo, router, settings, tmp_path / "data")
+        return Env(client, oauth, odoo, router, settings, tmp_path / "data", signouts)
 
     yield factory
     for cleanup in reversed(cleanups):
@@ -312,6 +318,11 @@ def call_whoami(env: Env, access_token: str | None) -> httpx.Response:
 
 def verify(env: Env, token: str):
     return asyncio.run(env.oauth.token_verifier.verify_token(token))
+
+
+def advance_clock(env: Env, seconds: float) -> None:
+    """Moves the authorization server's clock forward (tokens keep their absolute expiry times)."""
+    env.oauth.provider._clock = lambda: time.time() + seconds
 
 
 def grant_rows(env: Env) -> list[tuple]:
@@ -511,6 +522,7 @@ def test_code_reuse_fails_and_revokes_the_grant(env: Env):
     # RFC 6749 4.1.2: tokens issued from a replayed code are revoked.
     assert call_whoami(env, first.json()["access_token"]).status_code == 401
     assert refresh(env, client_id, first.json()["refresh_token"]).status_code == 400
+    assert env.signouts == [("priya@sahajta.ai", "authorization code reused")]
 
 
 def test_expired_code_is_rejected(env: Env):
@@ -688,6 +700,7 @@ def test_refresh_rotates_and_replay_revokes_the_grant(env: Env):
     assert second["access_token"] != first["access_token"]
     assert call_whoami(env, second["access_token"]).status_code == 200
 
+    advance_clock(env, REFRESH_REUSE_GRACE_SECONDS + 1)
     replay = refresh(env, client_id, first["refresh_token"])
     assert replay.status_code == 400
     assert replay.json()["error"] == "invalid_grant"
@@ -696,6 +709,45 @@ def test_refresh_rotates_and_replay_revokes_the_grant(env: Env):
     assert refresh(env, client_id, second["refresh_token"]).status_code == 400
     [(login, revoked_at, reason, key_wiped)] = grant_rows(env)
     assert revoked_at is not None and reason == "refresh token reused" and key_wiped
+    assert env.signouts == [("priya@sahajta.ai", "refresh token reused")]
+
+
+def test_refresh_token_reused_within_the_grace_window_gets_new_tokens(env: Env, caplog: pytest.LogCaptureFixture):
+    """A retry after a lost response must not sign the person out."""
+    client_id, first = connect(env)
+    second = refresh(env, client_id, first["refresh_token"]).json()
+    advance_clock(env, REFRESH_REUSE_GRACE_SECONDS - 5)
+    with caplog.at_level(logging.INFO, logger="sahajta_odoo_mcp.oauth.provider"):
+        retry = refresh(env, client_id, first["refresh_token"])
+    assert retry.status_code == 200, retry.text
+    third = retry.json()
+    assert third["refresh_token"] not in (first["refresh_token"], second["refresh_token"])
+    assert any(r.levelno == logging.INFO and "used again within" in r.getMessage() for r in caplog.records)
+    for tokens in (second, third):  # nothing was revoked: both new pairs work
+        assert call_whoami(env, tokens["access_token"]).status_code == 200
+    assert refresh(env, client_id, third["refresh_token"]).status_code == 200
+    [(_, revoked_at, _, _)] = grant_rows(env)
+    assert revoked_at is None and env.signouts == []
+    for secret in (first["refresh_token"], third["access_token"], third["refresh_token"]):
+        assert not any(secret in r.getMessage() for r in caplog.records)
+
+
+def test_parallel_refreshes_with_the_same_token_both_succeed(env: Env):
+    """Two requests that both loaded the token before either rotated it (the race inside the store)."""
+    client_id, tokens = connect(env)
+    provider = env.oauth.provider
+
+    async def race():
+        client = await provider.get_client(client_id)
+        loaded = [await provider.load_refresh_token(client, tokens["refresh_token"]) for _ in range(2)]
+        return await asyncio.gather(*(provider.exchange_refresh_token(client, token, ["odoo"]) for token in loaded))
+
+    first, second = asyncio.run(race())
+    assert first.refresh_token != second.refresh_token
+    for result in (first, second):
+        assert call_whoami(env, result.access_token).status_code == 200
+    [(_, revoked_at, _, _)] = grant_rows(env)
+    assert revoked_at is None and env.signouts == []
 
 
 def test_refresh_revokes_the_grant_when_odoo_rejects_the_key(env: Env):
@@ -707,6 +759,7 @@ def test_refresh_revokes_the_grant_when_odoo_rejects_the_key(env: Env):
     assert call_whoami(env, tokens["access_token"]).status_code == 401
     [(_, revoked_at, reason, key_wiped)] = grant_rows(env)
     assert revoked_at is not None and "Odoo rejected" in reason and key_wiped
+    assert env.signouts == [("priya@sahajta.ai", "Odoo rejected the API key")]
 
 
 def test_refresh_during_odoo_outage_is_temporary(env: Env):
@@ -719,6 +772,7 @@ def test_refresh_during_odoo_outage_is_temporary(env: Env):
     env.odoo.down = False
     # The same refresh token still works: nothing was rotated or revoked.
     assert refresh(env, client_id, tokens["refresh_token"]).status_code == 200
+    assert env.signouts == []
 
 
 def test_revocation_endpoint_revokes_the_grant(env: Env):
@@ -731,6 +785,7 @@ def test_revocation_endpoint_revokes_the_grant(env: Env):
     with pytest.raises(OdooError) as excinfo:
         env.oauth.credentials_for(access)
     assert excinfo.value.kind == "auth"
+    assert env.signouts == [("priya@sahajta.ai", "revoked by the client")]
 
 
 def test_revocation_with_refresh_token(env: Env):
@@ -749,6 +804,73 @@ def test_expired_access_token_is_rejected(env: Env):
         conn.execute("UPDATE tokens SET expires_at = ? WHERE kind = 'access'", (time.time() - 1,))
     assert verify(env, tokens["access_token"]) is None
     assert call_whoami(env, tokens["access_token"]).status_code == 401
+
+
+def test_last_used_write_failure_does_not_fail_the_request(env: Env, monkeypatch: pytest.MonkeyPatch):
+    _, tokens = connect(env)
+
+    def store_down(*args, **kwargs):
+        raise redis.ConnectionError("connection reset")
+
+    monkeypatch.setattr(env.oauth.store, "touch_grant", store_down)
+    assert verify(env, tokens["access_token"]) is not None
+    assert call_whoami(env, tokens["access_token"]).status_code == 200
+
+
+def test_setting_odoo_db_later_keeps_existing_sign_ins(make_env: Callable[..., Env]):
+    """JSON-2 needs no database name; an operator adding ODOO_DB later must not sign everyone out."""
+    env = make_env(odoo_db=None)
+    client_id, tokens = connect(env)
+    later = build_oauth(make_settings(env.data_dir.parent, odoo_db="sahajta"), httpx.AsyncClient())
+    try:
+        access = asyncio.run(later.token_verifier.verify_token(tokens["access_token"]))
+        assert access is not None
+        assert later.credentials_for(access).db is None  # the key goes where the person entered it
+
+        async def refresh_on_the_new_settings():
+            client = await later.provider.get_client(client_id)
+            stored = await later.provider.load_refresh_token(client, tokens["refresh_token"])
+            return await later.provider.exchange_refresh_token(client, stored, ["odoo"])
+
+        assert asyncio.run(refresh_on_the_new_settings()).access_token
+        [(_, revoked_at, _, _)] = grant_rows(env)
+        assert revoked_at is None
+    finally:
+        asyncio.run(later.aclose())
+
+
+def test_changing_the_odoo_url_still_refuses_existing_sign_ins(env: Env):
+    _, tokens = connect(env)
+    moved = build_oauth(make_settings(env.data_dir.parent, odoo_url="https://other-odoo.example.com"), httpx.AsyncClient())
+    try:
+        assert asyncio.run(moved.token_verifier.verify_token(tokens["access_token"])) is None
+    finally:
+        asyncio.run(moved.aclose())
+
+
+def test_expired_grants_are_reported_as_sign_outs(env: Env):
+    connect(env)
+    env.oauth.provider.purge(time.time() + env.settings.mcp_refresh_token_ttl_seconds + 1)
+    [(_, revoked_at, reason, key_wiped)] = grant_rows(env)
+    assert revoked_at is not None and reason == "expired" and key_wiped
+    assert env.signouts == [("priya@sahajta.ai", "expired")]
+
+
+def test_start_up_purge_failure_does_not_stop_the_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    def store_down(self, now):
+        raise redis.ConnectionError("connection reset")
+
+    monkeypatch.setattr(OAuthStore, "purge", store_down)
+    monkeypatch.setattr(RedisOAuthStore, "purge", store_down)
+    with caplog.at_level(logging.ERROR, logger="sahajta_odoo_mcp.oauth.provider"):
+        oauth = build_oauth(make_settings(tmp_path), httpx.AsyncClient())
+    try:
+        assert "Purging expired OAuth records failed" in caplog.text
+        assert oauth.routes and oauth.token_verifier is not None
+    finally:
+        asyncio.run(oauth.aclose())
 
 
 # ---------------------------------------------------------------------------------- CIMD

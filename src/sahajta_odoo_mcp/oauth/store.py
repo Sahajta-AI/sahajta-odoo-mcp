@@ -29,6 +29,8 @@ UNUSED_CLIENT_RETENTION_SECONDS = 30 * 24 * 3600
 REVOKED_GRANT_RETENTION_SECONDS = 90 * 24 * 3600
 # A new grant has no tokens until its code is exchanged; don't treat it as dead before then.
 GRANT_GRACE_SECONDS = 15 * 60
+# A retired refresh token used again this soon is a client retry or two refreshes racing, not a stolen copy.
+REFRESH_REUSE_GRACE_SECONDS = 120
 
 _SCHEMA = """
 CREATE TABLE clients (
@@ -164,6 +166,7 @@ class NewTokens:
 
 class ExchangeResult(Enum):
     OK = "ok"
+    REUSED = "reused"  # a refresh token retired within the grace window: a new pair was issued anyway
     REPLAYED = "replayed"  # the code / refresh token was already used: the grant has been revoked
     INVALID = "invalid"  # unknown, expired, or its grant is no longer active
 
@@ -419,7 +422,11 @@ class OAuthStore:
         )
 
     def rotate_refresh_token(self, old_hash: str, now: float, tokens: NewTokens) -> ExchangeResult:
-        """Retires a refresh token and issues a new pair. Presenting a retired token revokes the grant."""
+        """Retires a refresh token and issues a new pair.
+
+        A retired token presented again within REFRESH_REUSE_GRACE_SECONDS of its rotation gets a new
+        pair too (REUSED); later than that it revokes the grant (REPLAYED).
+        """
         with self._tx() as conn:
             row = conn.execute(
                 f"SELECT t.grant_id, t.rotated_at, t.expires_at, ({_ACTIVE}) AS active FROM tokens t "
@@ -428,11 +435,14 @@ class OAuthStore:
             ).fetchone()
             if row is None or not row["active"]:
                 return ExchangeResult.INVALID
-            if row["rotated_at"] is not None:
+            if row["rotated_at"] is not None and now - row["rotated_at"] > REFRESH_REUSE_GRACE_SECONDS:
                 _revoke(conn, row["grant_id"], "refresh token reused", now)
                 return ExchangeResult.REPLAYED
             if row["expires_at"] <= now:
                 return ExchangeResult.INVALID
+            if row["rotated_at"] is not None:
+                _insert_tokens(conn, row["grant_id"], now, tokens)
+                return ExchangeResult.REUSED
             conn.execute("UPDATE tokens SET rotated_at = ? WHERE token_hash = ?", (now, old_hash))
             _insert_tokens(conn, row["grant_id"], now, tokens)
         return ExchangeResult.OK
@@ -472,7 +482,11 @@ class OAuthStore:
 
     # ------------------------------------------------------------------ housekeeping
 
-    def purge(self, now: float) -> None:
+    def purge(self, now: float) -> list[str]:
+        """Deletes expired records and revokes grants that can never be used again; returns their ids.
+
+        One write transaction, so a refresh in another process cannot slip in between the check and the revoke.
+        """
         with self._tx() as conn:
             conn.execute("DELETE FROM pending_authorizations WHERE expires_at <= ?", (now,))
             conn.execute("DELETE FROM auth_codes WHERE expires_at <= ?", (now,))
@@ -487,14 +501,14 @@ class OAuthStore:
                     (now - GRANT_GRACE_SECONDS,),
                 )
             ]
-            for grant_id in dead:
-                _revoke(conn, grant_id, "expired", now)
+            revoked = [grant_id for grant_id in dead if _revoke(conn, grant_id, "expired", now)]
             conn.execute("DELETE FROM grants WHERE revoked_at <= ?", (now - REVOKED_GRANT_RETENTION_SECONDS,))
             conn.execute(
                 "DELETE FROM clients WHERE created_at <= ? "
                 "AND NOT EXISTS (SELECT 1 FROM grants g WHERE g.client_id = clients.client_id)",
                 (now - UNUSED_CLIENT_RETENTION_SECONDS,),
             )
+        return revoked
 
 
 def _revoke(conn: sqlite3.Connection, grant_id: str, reason: str, now: float) -> bool:
