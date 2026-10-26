@@ -689,7 +689,7 @@ async def test_policy_field_rules_apply_to_values(v):
         ("id", 5, "automatically"),
         ("display_name", "x", "automatically"),
         ("date_closed", "2026-01-01 00:00:00", "read-only"),
-        ("active", False, "MCP_ALLOW_ARCHIVE"),
+        ("active", False, "archiving is switched off"),
         ("x_cron_id", 1, "blocked model"),
         ("x_server_action_ids", [1], "blocked model"),
     ]:
@@ -1011,8 +1011,11 @@ async def test_one2many_nested_blocked_comodel_is_refused(v):
 
 
 async def test_one2many_into_a_write_protected_comodel_is_refused(v):
-    with pytest.raises(PolicyViolation):
-        await v.normalize_values("res.partner", {"bank_ids": [{"acc_number": "DE00"}]}, mode="write", record_ids=[1])
+    # bank accounts: the field itself is refused now, before any line is looked at
+    await rejected(
+        v.normalize_values("res.partner", {"bank_ids": [{"acc_number": "DE00"}]}, mode="write", record_ids=[1]),
+        "res.partner.bank_ids holds bank details",
+    )
     with pytest.raises(PolicyViolation):
         await v.normalize_values("res.partner", {"user_ids": [{"login": "eve"}]}, mode="write", record_ids=[1])
 
@@ -1028,3 +1031,392 @@ async def test_nesting_depth_limit(v):
 async def test_values_size_limit(v):
     lines = [{"name": "x" * 90_000} for _ in range(12)]
     await rejected(v.normalize_values("sale.order", {"order_line": lines}, mode="write", record_ids=[5]), "too large")
+
+
+# ================================================================================ fields Odoo cannot search
+
+
+async def test_fields_odoo_cannot_search_are_refused_up_front_with_a_stored_alternative(setup_fake):
+    v = make_validator(setup_fake)
+    problem = await rejected(v.normalize_domain("ir.ui.menu", [["complete_name", "ilike", "Sales"]]), "cannot be searched")
+    assert "Search on a stored field instead, e.g. name." in str(problem)
+    await rejected(v.normalize_domain("ir.ui.menu", [["parent_id.complete_name", "ilike", "Sales"]]), "cannot be searched")
+    await rejected(v.normalize_domain("ir.ui.menu", [["parent_id", "any", [["complete_name", "=", "x"]]]]), "cannot be searched")
+    assert await v.normalize_domain("ir.ui.menu", [["name", "ilike", "Sales"]]) == [["name", "ilike", "Sales"]]
+    # stored fields, and fields whose metadata does not say, are searched as before
+    assert await v.normalize_domain("crm.lead", [["name", "=", "x"]]) == [["name", "=", "x"]]
+
+
+# ================================================================================ analytic distribution
+
+
+async def test_analytic_distribution_is_validated_and_normalised(setup_fake):
+    v = make_validator(setup_fake)
+    out = await v.normalize_values("account.move.line", {"analytic_distribution": {"7": 60, "8": 40.5}}, mode="write", record_ids=[700])
+    assert out == {"analytic_distribution": {"7": 60, "8": 40.5}}
+    # one key may join one account per plan; ids may come as numbers
+    out = await v.normalize_values(
+        "account.move.line", {"analytic_distribution": {" 7 , 31 ": 100, 8: 25}}, mode="write", record_ids=[700]
+    )
+    assert out == {"analytic_distribution": {"7,31": 100, "8": 25}}
+    checked = [c.kwargs["domain"] for c in setup_fake.calls if c.model == "account.analytic.account" and c.method == "search"]
+    assert checked[-1] == [["id", "in", [7, 8, 31]]]
+    # emptying it is allowed
+    assert await v.normalize_values(
+        "account.move.line", {"analytic_distribution": False}, mode="write", record_ids=[700]
+    ) == {"analytic_distribution": False}
+
+
+@pytest.mark.parametrize(
+    "value, needle",
+    [
+        ({"7": 0}, "above 0 and at most 100"),
+        ({"7": 100.5}, "above 0 and at most 100"),
+        ({"7": -5}, "above 0 and at most 100"),
+        ({"7": "60"}, "must be a number"),
+        ({"7": True}, "must be a number"),
+        ({"7": float("nan")}, "must be a number"),
+        ({"7": None}, "must be a number"),
+        ({"Project Alpha": 60}, "not an analytic account id"),
+        ({"7,7": 50}, "not an analytic account id"),
+        ({"0": 50}, "not an analytic account id"),
+        ({"7,": 50}, "not an analytic account id"),
+        ({"-7": 50}, "not an analytic account id"),
+        ({"7": 50, " 7": 50}, "listed twice"),
+        ({"7,31": 50, "31,7": 50}, "listed twice"),
+        ({}, "must be an object"),
+        ([["7", 60]], "must be an object"),
+        ("7:60", "must be an object"),
+        ({"999": 50}, "account.analytic.account record id(s) [999] do not exist"),
+    ],
+)
+async def test_bad_analytic_distributions_are_refused(setup_fake, value, needle):
+    v = make_validator(setup_fake)
+    await rejected(
+        v.normalize_values("account.move.line", {"analytic_distribution": value}, mode="write", record_ids=[700]), needle
+    )
+
+
+async def test_other_json_fields_stay_unwritable(setup_fake):
+    v = make_validator(setup_fake)
+    await rejected(
+        v.normalize_values("account.move.line", {"x_other_json": {"7": 100}}, mode="write", record_ids=[700]), "json field"
+    )
+
+
+async def test_analytic_distribution_reads_as_names_in_previews(setup_fake):
+    v = make_validator(setup_fake)
+    assert await v.describe_analytic_distribution({"7": 60, "8": 40}) == "Project Alpha 60%, Project Beta 40%"
+    # the plain name: Odoo's display name adds the code and partner ("Project Alpha - Acme Corp")
+    assert setup_fake.calls_to("read")[-1].kwargs["fields"] == ["name"]
+    assert await v.describe_analytic_distribution({"7,31": 33.333, "999": 66.67}) == (
+        "Project Alpha / Marketing 33.33%, #999 66.67%"
+    )
+    assert await v.describe_analytic_distribution({}) == "none"
+    assert await v.describe_analytic_distribution(False) == "none"
+    setup_fake.errors[("account.analytic.account", "read")] = OdooError("no access", kind="access")
+    assert await v.describe_analytic_distribution({"7": 100.0}) == "#7 100%"
+
+
+# ================================================================================ app settings
+
+
+async def test_settings_take_feature_switches_and_refuse_apps_identity_and_edits(setup_fake):
+    v = make_validator(setup_fake)
+    values = {"group_analytic_accounting": True, "quotation_validity_days": 15}
+    assert await v.normalize_values("res.config.settings", values, mode="create") == values
+    await rejected(v.normalize_values("res.config.settings", {"module_crm": True}, mode="create"), "installs or removes an Odoo app")
+    await rejected(
+        v.normalize_values("res.config.settings", {"l10n_in_gstin": "27AAAAA0000A1Z5", "l10n_in_pan": "AAAAA0000A"}, mode="create"),
+        "l10n_in_gstin is part of the company's identity", "l10n_in_pan is part of the company's identity",
+    )
+    await rejected(v.normalize_values("res.config.settings", {"account_fiscal_country_id": 104}, mode="create"), "identity")
+    with pytest.raises(PolicyViolation, match="new settings record"):
+        await v.normalize_values("res.config.settings", {"quotation_validity_days": 15}, mode="write", record_ids=[1])
+
+
+# ================================================================================ e-mail templates
+
+
+async def test_templates_take_text_and_recipient_changes_only(setup_fake):
+    v = make_validator(setup_fake)
+    values = {
+        "subject": "Your quotation {{ object.name }}", "body_html": "<p>Hello</p>", "email_to": "a@example.com",
+        "email_cc": "accounts@sahajta.com", "partner_to": "{{ object.partner_id.id }}", "use_default_to": False,
+        "reply_to": "sales@sahajta.com",
+    }
+    assert await v.normalize_values("mail.template", values, mode="write", record_ids=[20]) == values
+    for name, value in [("email_from", "ceo@elsewhere.example"), ("attachment_ids", [1]), ("model_id", 90), ("name", "x")]:
+        await rejected(v.normalize_values("mail.template", {name: value}, mode="write", record_ids=[20]), "only these fields")
+    with pytest.raises(PolicyViolation, match="cannot be created"):
+        await v.normalize_values("mail.template", {"subject": "x"}, mode="create")
+
+
+# ================================================================================ accounting setup and bank details
+
+
+TAX = {
+    "name": "GST 5%", "amount": 5.0, "type_tax_use": "sale",
+    "invoice_repartition_line_ids": [
+        {"repartition_type": "base", "document_type": "invoice", "factor_percent": 100},
+        {"repartition_type": "tax", "document_type": "invoice", "factor_percent": 100, "account_id": 50},
+    ],
+}
+
+
+async def test_accounting_setup_is_created_with_its_lines(setup_fake):
+    v = make_validator(setup_fake)
+    out = await v.normalize_values("account.tax", TAX, mode="create")
+    assert out["invoice_repartition_line_ids"] == [[0, 0, line] for line in TAX["invoice_repartition_line_ids"]]
+    journal = {"name": "HDFC Current", "code": "HDFC", "type": "bank"}
+    assert await v.normalize_values("account.journal", journal, mode="create") == journal
+    assert await v.normalize_values("account.account", {"name": "GST Payable", "code": "2101"}, mode="create")
+
+
+async def test_accounting_setup_is_never_changed_or_archived(setup_fake):
+    v = make_validator(setup_fake, mcp_allow_archive=True)
+    for model, rid, values in [("account.tax", 1, {"amount": 12.0}), ("account.tax", 1, {"active": False}),
+                               ("account.account", 50, {"code": "4001"}), ("account.journal", 60, {"name": "x"})]:
+        with pytest.raises(PolicyViolation, match="changes past reports and GST returns"):
+            await v.normalize_values(model, values, mode="write", record_ids=[rid])
+    # a tax's lines are part of it: they cannot be written through any other record
+    setup_fake.schema["sale.order"]["x_tax_line_ids"] = {
+        "type": "one2many", "string": "Tax lines", "relation": "account.tax.repartition.line", "relation_field": "x_order_id",
+    }
+    line = {"repartition_type": "base", "document_type": "invoice", "factor_percent": 100}
+    with pytest.raises(PolicyViolation, match="only inside their account.tax record"):
+        await v.normalize_values("sale.order", {"x_tax_line_ids": [line]}, mode="write", record_ids=[5])
+
+
+async def test_journals_never_take_bank_details(setup_fake):
+    v = make_validator(setup_fake)
+    base = {"name": "HDFC Current", "code": "HDFC", "type": "bank"}
+    for name, value in [("bank_acc_number", "50100012345678"), ("bank_account_id", 1), ("bank_id", 1)]:
+        await rejected(v.normalize_values("account.journal", {**base, name: value}, mode="create"), f"{name} holds bank details")
+
+
+async def test_bills_never_get_a_recipient_bank_account(setup_fake):
+    v = make_validator(setup_fake)
+    await rejected(
+        v.normalize_values("account.move", {"partner_bank_id": 3}, mode="write", record_ids=[70]),
+        "account.move.partner_bank_id holds bank details",
+    )
+    assert await v.normalize_values("account.move", {"ref": "Bill 42"}, mode="write", record_ids=[70]) == {"ref": "Bill 42"}
+
+
+# ================================================================================ automation rules
+
+
+def lead_rule(**extra) -> dict:
+    return {
+        "name": "Hot leads go to Sam",
+        "model_id": 91,
+        "trigger": "on_create_or_write",
+        "filter_domain": "[('priority', '=', 'High'), ('expected_revenue', '>', 1000)]",
+        "action_server_ids": [
+            {"name": "Assign Sam", "state": "object_write", "update_path": "user_id", "value": "8"},
+            {"name": "Plan a call", "state": "next_activity", "activity_type_id": 4, "activity_summary": "Call"},
+        ],
+        **extra,
+    }
+
+
+async def test_automation_rule_is_created_with_a_literal_filter_and_safe_actions(setup_fake):
+    v = make_validator(setup_fake)
+    out = await v.normalize_values("base.automation", lead_rule(), mode="create")
+    # the filter is checked like a search and stored with Odoo's own keys
+    assert out["filter_domain"] == "[['priority', '=', '2'], ['expected_revenue', '>', 1000]]"
+    assert out["action_server_ids"] == [
+        [0, 0, {"name": "Assign Sam", "state": "object_write", "update_path": "user_id", "value": "8", "model_id": 91}],
+        [0, 0, {"name": "Plan a call", "state": "next_activity", "activity_type_id": 4, "activity_summary": "Call",
+                "model_id": 91}],
+    ]
+    checked = {c.model for c in setup_fake.calls if c.method == "search"}
+    assert {"res.users", "mail.activity.type", "ir.model"} <= checked
+
+
+@pytest.mark.parametrize(
+    "text, needle",
+    [
+        ("[('user_id', '=', uid)]", "fixed values"),
+        ("[('date_deadline', '<', context_today())]", "fixed values"),
+        ("__import__('os').system('id')", "fixed values"),
+        ("{'state': 'draft'}", "fixed values"),
+        ("[('nmae', '=', 'x')", "fixed values"),
+        ("[('nmae', '=', 'x')]", "'nmae' (in 'nmae') is not a field of crm.lead"),
+        ("[('priority', '=', 'Urgent')]", "not a valid choice"),
+        ("[('x_api_key', '!=', False)]", "credential"),
+    ],
+)
+async def test_rule_filters_must_be_literal_domains_checked_like_a_search(setup_fake, text, needle):
+    v = make_validator(setup_fake)
+    await rejected(v.normalize_values("base.automation", lead_rule(filter_domain=text), mode="create"), needle)
+    await rejected(v.normalize_values("base.automation", lead_rule(filter_pre_domain=text), mode="create"), needle)
+
+
+async def test_rule_filters_cannot_reach_blocked_models(setup_fake):
+    v = make_validator(setup_fake)
+    with pytest.raises(PolicyViolation):
+        await v.normalize_values("base.automation", lead_rule(filter_domain="[('x_cron_id.name', '=', 'x')]"), mode="create")
+
+
+@pytest.mark.parametrize("trigger, needle", [("on_change", "Python code"), ("on_webhook", "outside system"), ("on_unlink", "deleted")])
+async def test_rules_with_unsafe_triggers_are_refused(setup_fake, trigger, needle):
+    v = make_validator(setup_fake)
+    await rejected(v.normalize_values("base.automation", lead_rule(trigger=trigger), mode="create"), needle)
+
+
+@pytest.mark.parametrize(
+    "action, needle",
+    [
+        ({"name": "Run code", "state": "code"}, "runs Python code"),
+        ({"name": "Run code", "state": "code", "code": "env['res.users'].search([])"}, "hidden for safety"),
+        ({"name": "Hook", "state": "webhook"}, "outside web address"),
+        ({"name": "Hook", "state": "webhook", "webhook_url": "https://example.com/x"}, "hidden for safety"),
+        ({"name": "SMS", "state": "sms"}, "text messages"),
+        ({"name": "Multi", "state": "multi"}, "other server actions"),
+        ({"name": "New", "state": "object_create"}, "creates new records"),
+        ({"name": "Calc", "state": "object_write", "update_path": "probability", "evaluation_type": "equation",
+          "value": "record.probability * 2"}, "fixed value"),
+        ({"name": "Deep", "state": "object_write", "update_path": "partner_id.email", "value": "x@y.z"}, "own record"),
+        ({"name": "Nothing", "state": "object_write", "value": "1"}, "update_path"),
+        ({"name": "Close", "state": "object_write", "update_path": "date_closed", "value": "2026-01-01 00:00:00"}, "read-only"),
+        ({"name": "Key", "state": "object_write", "update_path": "x_api_key", "value": "k"}, "credential"),
+        ({"name": "Cron", "state": "object_write", "update_path": "x_cron_id", "value": "1"},
+         "crm.lead.x_cron_id, which points to a blocked model (ir.cron)"),
+        ({"name": "Archive", "state": "object_write", "update_path": "active", "update_boolean_value": "false"},
+         "archiving is switched off"),
+        ({"name": "Typo", "state": "object_write", "update_path": "stage_naem", "value": "1"}, "not a field of crm.lead"),
+        ({"name": "Prio", "state": "object_write", "update_path": "priority", "value": "Urgent"}, "not a valid choice"),
+        ({"name": "Stage", "state": "object_write", "update_path": "stage_id", "value": "999"},
+         "crm.stage record id(s) [999] do not exist"),
+        ({"name": "Stage", "state": "object_write", "update_path": "stage_id", "resource_ref": "crm.tag,1"},
+         "must point at a crm.stage record"),
+        ({"name": "Stage", "state": "object_write", "update_path": "stage_id", "value": "two"}, "numeric id"),
+        ({"name": "Tag", "state": "object_write", "update_path": "tag_ids", "update_m2m_operation": "add"}, "name the crm.tag"),
+        ({"name": "Color", "state": "object_write", "update_path": "color", "value": "red"}, "whole number"),
+        ({"name": "Rev", "state": "object_write", "update_path": "expected_revenue", "value": "lots"}, "must be a number"),
+        ({"name": "Props", "state": "object_write", "update_path": "lead_properties", "value": "{}"}, "properties"),
+        ({"name": "Lines", "state": "object_write", "update_path": "message_ids", "value": "1"}, "type 'one2many'"),
+        ({"name": "Ref", "state": "object_write", "update_path": "x_source_ref", "value": "res.partner,1"}, "type 'reference'"),
+        ({"name": "Name", "state": "object_write", "update_path": "name", "value": ""}, "required"),
+        ({"name": "Groups", "state": "next_activity", "group_ids": [1]}, "only these fields"),
+        ({"name": "Model", "state": "next_activity", "model_id": 90}, "rule's model"),
+        ({"name": "Rule link", "state": "next_activity", "base_automation_id": 300}, "set automatically from the parent"),
+    ],
+)
+async def test_rule_actions_outside_the_safe_set_are_refused(setup_fake, action, needle):
+    v = make_validator(setup_fake)
+    await rejected(v.normalize_values("base.automation", lead_rule(action_server_ids=[action]), mode="create"), needle)
+
+
+async def test_update_actions_pass_the_same_field_rules_as_a_direct_change(setup_fake):
+    v = make_validator(setup_fake)
+    confirm = {"name": "Confirm", "state": "object_write", "update_path": "state", "value": "sale"}
+    rule = {"name": "Auto-confirm", "model_id": 94, "trigger": "on_create", "action_server_ids": [confirm]}
+    await rejected(v.normalize_values("base.automation", rule, mode="create"), "sale.order.state, which is a workflow status")
+    ok = lead_rule(action_server_ids=[
+        {"name": "Hot", "state": "object_write", "update_path": "is_hot", "update_boolean_value": "true"},
+        {"name": "Prio", "state": "object_write", "update_path": "priority", "value": "3"},
+        {"name": "Tag", "state": "object_write", "update_path": "tag_ids", "update_m2m_operation": "add", "resource_ref": "crm.tag,2"},
+        {"name": "Call", "state": "object_write", "update_path": "next_call_at", "value": "2026-11-02 10:00:00"},
+        {"name": "Due", "state": "object_write", "update_path": "date_deadline", "value": "2026-11-30"},
+        {"name": "Rev", "state": "object_write", "update_path": "expected_revenue", "value": "1500.5"},
+        {"name": "Notes", "state": "object_write", "update_path": "description", "html_value": "<p>Hot</p>"},
+        {"name": "No stage", "state": "object_write", "update_path": "stage_id", "value": "0"},
+    ])
+    out = await v.normalize_values("base.automation", ok, mode="create")
+    # a fixed date-time is the user's local time (here Berlin, UTC+1 in November) and Odoo stores UTC
+    assert out["action_server_ids"][3][2]["value"] == "2026-11-02 09:00:00"
+
+
+async def test_email_and_follower_actions_need_the_outbound_switch(setup_fake):
+    v = make_validator(setup_fake)
+    mail = {"name": "Thank you", "state": "mail_post", "template_id": 20, "mail_post_method": "email"}
+    follow = {"name": "Follow", "state": "followers", "partner_ids": [1]}
+    for action in (mail, follow):
+        await rejected(
+            v.normalize_values("base.automation", lead_rule(action_server_ids=[action]), mode="create"), "switched off for Claude"
+        )
+    note = {"name": "Note", "state": "mail_post", "template_id": 20, "mail_post_method": "note"}
+    assert await v.normalize_values("base.automation", lead_rule(action_server_ids=[note]), mode="create")
+    on = make_validator(setup_fake, mcp_allow_outbound_messages=True)
+    out = await on.normalize_values("base.automation", lead_rule(action_server_ids=[mail, follow]), mode="create")
+    assert [a[2]["state"] for a in out["action_server_ids"]] == ["mail_post", "followers"]
+    await rejected(
+        on.normalize_values("base.automation", lead_rule(trigger="on_message_received", action_server_ids=[mail]), mode="create"),
+        "endless e-mail loop",
+    )
+
+
+async def test_rules_may_watch_only_records_claude_may_change(setup_fake):
+    v = make_validator(setup_fake)
+    with pytest.raises(PolicyViolation, match="system or security setup"):
+        await v.normalize_values("base.automation", lead_rule(model_id=92, filter_domain=False), mode="create")
+    with pytest.raises(PolicyViolation, match="setup records"):
+        await v.normalize_values("base.automation", lead_rule(model_id=93, filter_domain=False), mode="create")
+    await rejected(v.normalize_values("base.automation", lead_rule(model_id=999), mode="create"), "does not exist")
+    await rejected(v.normalize_values("base.automation", {"name": "x", "trigger": "on_create"}, mode="create"), "model_id is required")
+    await rejected(v.normalize_values("base.automation", lead_rule(trigger=False), mode="create"), "trigger is required")
+
+
+async def test_editing_a_rule_checks_the_rule_as_it_will_be(setup_fake):
+    v = make_validator(setup_fake)
+    out = await v.normalize_values(
+        "base.automation",
+        {"name": "Renamed", "action_server_ids": [
+            [1, 400, {"activity_summary": "Call them"}],
+            {"name": "Prio", "state": "object_write", "update_path": "priority", "value": "2"},
+        ]},
+        mode="write", record_ids=[300],
+    )
+    assert out["action_server_ids"] == [
+        [1, 400, {"activity_summary": "Call them"}],
+        [0, 0, {"name": "Prio", "state": "object_write", "update_path": "priority", "value": "2", "model_id": 91}],
+    ]
+    for values, needle in [
+        ({"action_server_ids": [[1, 400, {"state": "code"}]]}, "runs Python code"),
+        ({"action_server_ids": [[1, 400, {"model_id": 90}]]}, "only when the record is created"),
+        ({"action_server_ids": [[1, 401, {"name": "x"}]]}, "does not belong"),
+        ({"trigger": "on_webhook"}, "outside system"),
+        ({"model_id": 90}, "only when the record is created"),
+        ({"filter_domain": "[('user_id', '=', uid)]"}, "fixed values"),
+    ]:
+        await rejected(v.normalize_values("base.automation", values, mode="write", record_ids=[300]), needle)
+    # a rule a person set up with Python code is not touched through Claude...
+    await rejected(v.normalize_values("base.automation", {"name": "x"}, mode="write", record_ids=[301]), "'Python thing' runs Python code")
+    await rejected(v.normalize_values("base.automation", {"name": "x"}, mode="write", record_ids=[300, 301]), "one at a time")
+
+
+async def test_rules_can_always_be_switched_off_but_only_safe_ones_on(setup_fake):
+    v = make_validator(setup_fake, mcp_allow_archive=True)
+    assert await v.normalize_values("base.automation", {"active": False}, mode="write", record_ids=[300, 301]) == {"active": False}
+    assert await v.normalize_values("base.automation", {"active": True}, mode="write", record_ids=[300]) == {"active": True}
+    await rejected(v.normalize_values("base.automation", {"active": True}, mode="write", record_ids=[301]), "runs Python code")
+    await rejected(
+        make_validator(setup_fake).normalize_values("base.automation", {"active": False}, mode="write", record_ids=[300]),
+        "archiving is switched off",
+    )
+
+
+async def test_secrets_and_code_on_rules_and_actions_are_hidden_everywhere(setup_fake):
+    v = make_validator(setup_fake)
+    fields = await v.fields_of("base.automation")
+    assert "url" not in fields and "webhook_uuid" not in fields and "trigger" in fields
+    assert "code" not in await v.fields_of("ir.actions.server")
+    assert "code" in setup_fake.schema["ir.actions.server"], "the cached schema itself is untouched"
+    await rejected(v.check_field_names("base.automation", ["name", "webhook_uuid"]), "hidden for safety")
+    await rejected(v.check_field_names("ir.actions.server", ["code"]), "hidden for safety")
+    await rejected(v.normalize_domain("base.automation", [["webhook_uuid", "=", "abc"]]), "hidden for safety")
+    await rejected(v.normalize_domain("base.automation", [["action_server_ids.code", "ilike", "password"]]), "hidden for safety")
+    # hidden names never cost an extra trip to Odoo
+    assert len(setup_fake.calls_to("fields_get")) == 2
+
+
+async def test_server_actions_are_never_written_outside_a_rule(setup_fake):
+    v = make_validator(setup_fake)
+    await rejected(
+        v.normalize_values("crm.lead", {"x_server_action_ids": [[0, 0, {"name": "x", "state": "next_activity"}]]},
+                           mode="write", record_ids=[100]),
+        "server actions can be added only inside an automation rule",
+    )

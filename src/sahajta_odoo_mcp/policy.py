@@ -7,6 +7,10 @@ Two layers:
   * SOFT rules come from Settings and default to "off" (read-only, no archiving,
     no cancelling, no outbound e-mail/SMS).
 
+A few setup areas are open within limits (see "Setup areas" below): app settings, e-mail
+template texts, automation rules without code, and new accounting setup. Every change
+there still goes through preview and approval.
+
 Odoo's own access rights still apply on top of all of this: the server can never
 do more than the signed-in Odoo user is allowed to do in the Odoo UI.
 """
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from .config import Settings
@@ -59,15 +64,13 @@ HARD_BLOCKED_MODELS: frozenset[str] = frozenset(
         "sms.account.phone",
         "sms.account.code",
         "sms.account.sender",
-        "res.config.settings",
+        # (res.config.settings is a limited setup area, see below)
         "res.config",
         "res.config.installer",
-        # code execution / automation
-        "ir.actions.server",
+        # code execution / automation (automation rules and their server actions are a limited setup area, see below)
         "ir.cron",
         "ir.cron.trigger",
         "ir.cron.progress",
-        "base.automation",
         "ir.actions.client",
         # security configuration
         "ir.model.access",
@@ -107,67 +110,62 @@ HARD_BLOCKED_MODELS: frozenset[str] = frozenset(
     }
 )
 
-# Readable (where Odoo allows it) but never writable. Prefix matches end with ".".
-HARD_READONLY_PREFIXES: tuple[str, ...] = (
-    "ir.",  # all technical models (views, menus, sequences, attachments, fields, ...)
-    "base.",
-    "base_import.",
-    "res.users",  # also res.users.settings etc.; creating users also costs subscription seats
-    "res.groups",
-    "res.company",
-    "res.currency",
-    "res.lang",
-    "auth",
-    "iap.",
-    "payment.",
-    "bus.",
-    "web_editor.",
-    "website",  # the website model holds custom <script> code; pages hold raw HTML
-    "mail.template",
-    "mail.mail",
-    "mail.message",  # use the dedicated note tool instead
-    "mail.compose.message",
-    "mail.followers",  # adding a follower makes Odoo e-mail that person
-    "mail.alias",
-    "mail.server",
-    "mailing.",  # mass mailing campaigns
-    "sms.",
-    "whatsapp.",
-    "snailmail.",  # costs money (postal mail)
-    "account.change.lock.date",
-    "res.partner.bank",  # changing bank details is the classic payment-fraud vector
-    "crm.iap",
-    "iap",
-    "account.lock_exception",
-    "spreadsheet.revision",
-    "documents.share",
-    "knowledge.invite",
-    # accounting configuration: a wrong edit silently corrupts every future entry and report
-    "account.account",
-    "account.tax",
-    "account.fiscal.position",
-    "account.journal",
-    "account.report",
-    "account.reconcile.model",
-    "account.payment.method",
-    "account.cash.rounding",
-    "account.code.mapping",
-    "account.root",
-    "account.group",
-    "account.return.type",
-    "account.return.check.template",
-    "account.online.",  # bank-sync connections
-    "decimal.precision",
-    # Odoo's own AI agents and prompts (an AI must not rewrite another AI's instructions)
-    "ai.",
-    # e-mail infrastructure, outside guests, digests
-    "digest.",
-    "mail.ice.server",
-    "mail.gateway.allowed",
-    "mail.guest",
-    "res.country",
-    "spreadsheet.dashboard.share",  # creates a public link to a dashboard
+# Readable (where Odoo allows it) but never writable, by area: each area has its own short reason, which the AI
+# and the person see. Prefix matches end with "."; the others also cover longer names (account.tax.group, ...).
+PROTECTED_AREAS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        # changing bank details is the classic payment-fraud vector
+        "holds bank details, and a wrong bank account sends money to the wrong place",
+        ("res.partner.bank", "account.online."),  # account.online.: bank-sync connections
+    ),
+    ("sets the accounting lock dates", ("account.change.lock.date", "account.lock_exception")),
+    (
+        "is accounting setup: a wrong change silently affects every future entry and report",
+        (
+            "account.account", "account.tax", "account.fiscal.position", "account.journal", "account.report",
+            "account.reconcile.model", "account.payment.method", "account.cash.rounding", "account.code.mapping",
+            "account.root", "account.group", "account.return.type", "account.return.check.template",
+            "decimal.precision",
+        ),
+    ),
+    (
+        # mail.message: use the note tool instead; mail.followers: adding a follower makes Odoo e-mail that person
+        "sends or stores e-mails and messages (to log an internal note, use odoo_add_note)",
+        (
+            "mail.template", "mail.mail", "mail.message", "mail.compose.message", "mail.followers", "mail.alias",
+            "mail.server", "mail.ice.server", "mail.gateway.allowed", "mail.guest", "mailing.", "sms.", "whatsapp.",
+            "snailmail.", "digest.",
+        ),
+    ),
+    ("handles payments or paid Odoo credits", ("payment.", "iap.", "iap", "crm.iap")),
+    # the website model holds custom <script> code; pages hold raw HTML
+    ("holds website pages and their code", ("website", "web_editor.")),
+    # an AI must not rewrite another AI's instructions
+    ("holds Odoo's own AI agents and their instructions", ("ai.",)),
+    (
+        "shares data outside the company or keeps a document's edit history",
+        ("spreadsheet.dashboard.share", "documents.share", "knowledge.invite", "spreadsheet.revision"),
+    ),
+    (
+        # ir.: all technical models (views, menus, sequences, attachments, fields, server actions, ...);
+        # res.users: also res.users.settings etc.; creating users also costs subscription seats
+        "is system or security setup (users, access rights, companies, technical settings)",
+        (
+            "ir.", "base.", "base_import.", "res.users", "res.groups", "res.company", "res.currency", "res.lang",
+            "res.country", "auth", "bus.",
+        ),
+    ),
 )
+HARD_READONLY_PREFIXES: tuple[str, ...] = tuple(prefix for _, prefixes in PROTECTED_AREAS for prefix in prefixes)
+
+
+def protected_area(model: str) -> str | None:
+    """The reason a model is write-protected, or None when it is not in a protected area."""
+    for reason, prefixes in PROTECTED_AREAS:
+        for prefix in prefixes:
+            if model == prefix.rstrip(".") or model.startswith(prefix):
+                return reason
+    return None
 
 # Writable only with MCP_ALLOW_OUTBOUND_MESSAGES: creating these e-mails or shares with outside people.
 OUTBOUND_GATED_PREFIXES: tuple[str, ...] = (
@@ -181,7 +179,130 @@ OUTBOUND_GATED_PREFIXES: tuple[str, ...] = (
 
 # Note: communication models (mail.compose.message, mailing.*, sms.*, whatsapp.*, snailmail.*) are in the
 # list above and stay read-only even with MCP_ALLOW_OUTBOUND_MESSAGES; that flag only enables the dedicated,
-# previewed odoo_send_message tool and message-sending buttons.
+# previewed odoo_send_message tool, message-sending buttons, and e-mail/follower actions in automation rules.
+
+# ---------------------------------------------------------------------------
+# Setup areas: open within limits, always through preview and approval
+# ---------------------------------------------------------------------------
+
+SETTINGS_MODEL = "res.config.settings"  # create a settings record, then press its Save button (execute)
+TEMPLATE_MODEL = "mail.template"  # existing templates: subject, body and recipients only
+AUTOMATION_MODEL = "base.automation"  # rules without code; their actions only nested inside them
+SERVER_ACTION_MODEL = "ir.actions.server"
+
+# Accounting setup: new records may be created; existing ones are never changed or archived through Claude,
+# because entries already use them.
+CREATE_ONLY_MODELS: frozenset[str] = frozenset(
+    {"account.account", "account.tax", "account.fiscal.position", "account.reconcile.model", "account.journal"}
+)
+_SETUP_NAMES: dict[str, str] = {
+    "account.account": "Accounts",
+    "account.tax": "Taxes",
+    "account.fiscal.position": "Fiscal positions",
+    "account.reconcile.model": "Reconciliation models",
+    "account.journal": "Journals",
+}
+
+# Models these rules open, although their prefix is protected or they were blocked before.
+LIMITED_MODELS: frozenset[str] = CREATE_ONLY_MODELS | {SETTINGS_MODEL, TEMPLATE_MODEL, AUTOMATION_MODEL}
+
+# Lines that may be written only inside their parent record, through these fields (never on their own).
+NESTED_LINES: dict[tuple[str, str], str] = {
+    ("account.tax", "invoice_repartition_line_ids"): "account.tax.repartition.line",
+    ("account.tax", "refund_repartition_line_ids"): "account.tax.repartition.line",
+    ("account.tax", "repartition_line_ids"): "account.tax.repartition.line",
+    ("account.fiscal.position", "account_ids"): "account.fiscal.position.account",
+    ("account.fiscal.position", "tax_ids"): "account.fiscal.position.tax",  # Odoo 18 and older (19 links taxes)
+    ("account.reconcile.model", "line_ids"): "account.reconcile.model.line",
+    (AUTOMATION_MODEL, "action_server_ids"): SERVER_ACTION_MODEL,
+}
+_LINE_PARENTS: dict[str, tuple[str, str]] = {line: parent for parent, line in NESTED_LINES.items()}
+
+# On these models only the listed fields may be written; all others stay read-only.
+FIELD_ALLOWLISTS: dict[str, frozenset[str]] = {
+    TEMPLATE_MODEL: frozenset({"subject", "body_html", "email_to", "email_cc", "partner_to", "use_default_to", "reply_to"}),
+    AUTOMATION_MODEL: frozenset(
+        {
+            "name", "description", "model_id", "trigger", "trigger_field_ids", "trg_selection_field_id",
+            "trg_field_ref", "trg_date_id", "trg_date_range", "trg_date_range_mode", "trg_date_range_type",
+            "trg_date_calendar_id", "filter_pre_domain", "filter_domain", "action_server_ids", "active",
+        }
+    ),
+    SERVER_ACTION_MODEL: frozenset(
+        {
+            "name", "sequence", "state", "model_id",
+            # update a field with a fixed value
+            "update_path", "evaluation_type", "value", "html_value", "resource_ref", "update_boolean_value",
+            "update_m2m_operation",
+            # add followers
+            "followers_type", "followers_partner_field_name", "partner_ids",
+            # post a message or send an e-mail from a template
+            "template_id", "mail_post_method", "mail_post_autofollow",
+            # create an activity
+            "activity_type_id", "activity_summary", "activity_note", "activity_date_deadline_range",
+            "activity_date_deadline_range_type", "activity_user_type", "activity_user_id", "activity_user_field_name",
+        }
+    ),
+}
+
+# Never read, searched, grouped or written: a webhook's secret address, and Python code (which may hold keys).
+HIDDEN_FIELDS: dict[str, frozenset[str]] = {
+    AUTOMATION_MODEL: frozenset({"url", "webhook_uuid"}),
+    SERVER_ACTION_MODEL: frozenset({"code", "webhook_url", "webhook_sample_payload"}),
+}
+
+# The only buttons Claude may press on these models.
+LIMITED_BUTTONS: dict[str, frozenset[str]] = {
+    SETTINGS_MODEL: frozenset({"execute"}),  # the settings screen's Save (drawn by Odoo's web client, not the view)
+    TEMPLATE_MODEL: frozenset(),
+    AUTOMATION_MODEL: frozenset(),
+    **{model: frozenset() for model in CREATE_ONLY_MODELS},
+}
+_BUTTONS_REFUSED: dict[str, str] = {
+    SETTINGS_MODEL: "Only the settings screen's Save button (execute) can be pressed through Claude; the other "
+    "settings buttons open or install things. Use them in Odoo.",
+    TEMPLATE_MODEL: "Buttons on e-mail templates cannot be pressed through Claude. Claude can only change a "
+    "template's subject, body and recipients.",
+    AUTOMATION_MODEL: "Buttons on automation rules cannot be pressed through Claude. To stop a rule, archive it "
+    "(set active to false).",
+}
+
+# Settings fields that are refused (module_* is checked separately).
+_IDENTITY_FIELD_RE = re.compile(
+    r"^(company_name|company_registry|company_details|vat|logo|email|phone|mobile|website|street2?|city|zip|"
+    r"state_id|partner_id)$|(^|_)(vat|gstin|pan|tan|registry|logo|country)(_|$)|bank"
+)
+_SECURITY_SETTING_RE = re.compile(r"^auth_|totp|signup|password|username|audit_trail|lock_date")
+
+# Automation rules
+AUTOMATION_TRIGGERS: frozenset[str] = frozenset(
+    {
+        "on_create", "on_write", "on_create_or_write", "on_stage_set", "on_user_set", "on_tag_set", "on_state_set",
+        "on_priority_set", "on_archive", "on_unarchive", "on_time", "on_time_created", "on_time_updated",
+        "on_message_received", "on_message_sent",
+    }
+)
+_REFUSED_TRIGGERS: dict[str, str] = {
+    "on_change": "runs Python code while someone is editing a record",
+    "on_webhook": "lets an outside system start the rule through a web address",
+    "on_unlink": "runs when records are deleted",
+}
+_MESSAGE_TRIGGERS = frozenset({"on_message_received", "on_message_sent"})
+AUTOMATION_ACTION_TYPES: frozenset[str] = frozenset({"object_write", "followers", "next_activity", "mail_post"})
+_REFUSED_ACTIONS: dict[str, str] = {
+    "code": "runs Python code",
+    "webhook": "sends record data to an outside web address",
+    "sms": "sends text messages",
+    "whatsapp": "sends WhatsApp messages",
+    "multi": "runs other server actions",
+    "object_create": "creates new records",
+    "object_copy": "duplicates records",
+    "remove_followers": "removes followers",
+}
+_ALLOWED_ACTIONS_TEXT = (
+    "Allowed: update a field with a fixed value, add followers, create an activity, post a message or send an "
+    "e-mail from a template."
+)
 
 # ---------------------------------------------------------------------------
 # Fields
@@ -205,11 +326,16 @@ WORKFLOW_FIELDS: frozenset[str] = frozenset({"state", "move_type", "payment_stat
 
 # (model, field) pairs that pick what a new record is (customer invoice, vendor bill, credit note, ...).
 # Odoo marks them read-only because its own screens set them on create (the record always starts in
-# draft); they may be set on create here too, but never changed afterwards.
-CREATE_ONLY_FIELDS: frozenset[tuple[str, str]] = frozenset({("account.move", "move_type")})
+# draft); they may be set on create here too, but never changed afterwards. An automation rule's model is
+# fixed too: changing it would detach its actions.
+CREATE_ONLY_FIELDS: frozenset[tuple[str, str]] = frozenset(
+    {("account.move", "move_type"), (AUTOMATION_MODEL, "model_id"), (SERVER_ACTION_MODEL, "model_id")}
+)
 
 # Field types the AI can never write: files, and free-form JSON whose changes a preview can't show clearly.
 UNWRITABLE_TYPES: frozenset[str] = frozenset({"binary", "image", "properties", "properties_definition", "json"})
+# The one JSON field that is written, with its own checks: {"analytic account id(s)": percentage}.
+ANALYTIC_FIELD = "analytic_distribution"
 
 # ---------------------------------------------------------------------------
 # Methods
@@ -356,10 +482,10 @@ HARD_BLOCKED_PREFIXES: tuple[str, ...] = (
     "auth.passkey",
     "ir.profile",
     "ir.cron",
-    "ir.actions.server",
+    "ir.actions.server.",  # e.g. ir.actions.server.history (old versions of Python code); the model itself is limited
     "ir.module",
     "base.module",
-    "base.automation",
+    "base.automation.",  # the rules themselves are a limited setup area
     "payment.provider",
     "payment.token",
     "payment.data",
@@ -388,6 +514,8 @@ class SafetyPolicy:
         self._writable_allowlist = {m.strip() for m in settings.mcp_writable_models}
         self._extra_blocked_methods = tuple(m.strip().lower() for m in settings.mcp_blocked_methods)
         self._extra_allowed_methods = {m.strip() for m in settings.mcp_extra_allowed_methods}
+        # What to do when something is switched off for Claude (never an operator setting's name).
+        self._elsewhere = f"Do it in Odoo, or ask {settings.mcp_admin_contact.strip() or 'your Odoo admin'}."
 
     # -- models ---------------------------------------------------------------------
 
@@ -406,34 +534,83 @@ class SafetyPolicy:
             raise PolicyViolation(reason)
 
     def model_write_block_reason(self, model: str) -> str | None:
+        """Why no change at all may be made on model. Creating versus changing is checked by change_block_reason."""
         reason = self.model_read_block_reason(model)
         if reason:
             return reason
         if not self.settings.read_write:
-            return "this server is in read-only mode (MCP_ACCESS_MODE=read_only)"
+            return f"Changes are switched off for Claude: this connection is in read-only mode. {self._elsewhere}"
         if model.startswith(OUTBOUND_GATED_PREFIXES) and not self.settings.mcp_allow_outbound_messages:
             return (
-                f"'{model}' e-mails or shares with people outside the company, which is disabled "
-                "(MCP_ALLOW_OUTBOUND_MESSAGES=false)"
+                f"'{model}' e-mails or shares with people outside the company, which is switched off for Claude. "
+                f"{self._elsewhere}"
             )
-        for prefix in HARD_READONLY_PREFIXES:
-            if model == prefix.rstrip(".") or model.startswith(prefix):
-                return (
-                    f"'{model}' is protected (system/security settings, communications, or financially sensitive "
-                    "data such as bank details) and can only be changed by a person in Odoo"
-                )
-        if model in self._extra_readonly or _matches_any(model, self._extra_readonly):
-            return f"'{model}' is read-only by this server's configuration"
+        area = None if model in LIMITED_MODELS else protected_area(model)
+        if area:
+            return f"'{model}' {area}, so Claude cannot change it. A person can change it in Odoo."
+        reason = self._configured_readonly_reason(model)
+        if reason:
+            return reason
         if self._writable_allowlist and not (
             model in self._writable_allowlist or _matches_any(model, self._writable_allowlist)
         ):
-            return f"'{model}' is not in this server's list of writable models (MCP_WRITABLE_MODELS)"
+            return f"'{model}' is not on the list of records Claude may change on this connection. {self._elsewhere}"
+        return None
+
+    def _configured_readonly_reason(self, model: str) -> str | None:
+        if model in self._extra_readonly or _matches_any(model, self._extra_readonly):
+            return f"'{model}' is read-only by this server's configuration"
         return None
 
     def check_write(self, model: str) -> None:
         reason = self.model_write_block_reason(model)
         if reason:
-            raise PolicyViolation(f"Changes to {reason}." if reason.startswith("this server") else reason)
+            raise PolicyViolation(reason)
+
+    def change_block_reason(self, model: str, mode: str) -> str | None:
+        """Why creating (mode 'create') or changing existing records (any other mode) is refused on a model
+        that model_write_block_reason lets through: the limited setup areas."""
+        if mode == "create":
+            if model == TEMPLATE_MODEL:
+                return (
+                    "New e-mail templates cannot be created through Claude. Claude can change the subject, body and "
+                    "recipients of an existing template; create new templates in Odoo."
+                )
+            return None
+        if model in CREATE_ONLY_MODELS:
+            return (
+                f"{_SETUP_NAMES[model]} already in Odoo cannot be changed or archived through Claude: changing setup "
+                "that entries already use changes past reports and GST returns. Do it in Odoo."
+            )
+        if model == SETTINGS_MODEL:
+            return (
+                "Settings are changed by creating a new settings record with only the values to change "
+                f"(odoo_preview_create on {SETTINGS_MODEL}), then pressing its Save button (method 'execute'). "
+                "An existing settings record cannot be edited."
+            )
+        return None
+
+    def check_change(self, model: str, mode: str) -> None:
+        reason = self.change_block_reason(model, mode)
+        if reason:
+            raise PolicyViolation(reason)
+
+    def nested_write_block_reason(self, parent: str, field: str, comodel: str, *, creating: bool) -> str | None:
+        """Why a comodel record may not be created (creating=True) or edited inside parent.field."""
+        if NESTED_LINES.get((parent, field)) == comodel:
+            # part of the parent record, which the caller already checked; only blocks configured here still count
+            return self.model_read_block_reason(comodel) or self._configured_readonly_reason(comodel)
+        if comodel in _LINE_PARENTS:
+            owner, owner_field = _LINE_PARENTS[comodel]
+            return f"{comodel} records can be written only inside their {owner} record (field {owner_field})"
+        return self.model_write_block_reason(comodel) or self.change_block_reason(
+            comodel, "create" if creating else "write"
+        )
+
+    def check_nested_write(self, parent: str, field: str, comodel: str, *, creating: bool) -> None:
+        reason = self.nested_write_block_reason(parent, field, comodel, creating=creating)
+        if reason:
+            raise PolicyViolation(reason)
 
     # -- fields -----------------------------------------------------------------------
 
@@ -444,23 +621,38 @@ class SafetyPolicy:
             return "looks like a credential or secret"
         if name in MAGIC_FIELDS:
             return "is maintained automatically by Odoo"
+        if name in HIDDEN_FIELDS.get(model or "", ()):
+            return "is hidden for safety (secret addresses and Python code are never read or written)"
+        allowlist = FIELD_ALLOWLISTS.get(model or "")
+        if allowlist is not None and name not in allowlist:
+            return f"cannot be changed through Claude; on {model} only these fields can: {', '.join(sorted(allowlist))}"
         create_only = (model, name) in CREATE_ONLY_FIELDS
         if create_only:
             if not creating:
-                return "can be set only when the record is created (e.g. move_type='out_invoice'), never changed afterwards"
-        elif name in WORKFLOW_FIELDS:
+                return "can be set only when the record is created, never changed afterwards"
+        elif name in WORKFLOW_FIELDS and allowlist is None:  # (a server action's 'state' is its type, not a status)
             return "is a workflow status; use odoo_list_actions and run the matching button instead"
         ftype = meta.get("type")
-        if ftype in UNWRITABLE_TYPES:
+        if ftype in UNWRITABLE_TYPES and not (ftype == "json" and name == ANALYTIC_FIELD):
             return f"is a {ftype} field, which this server never writes (a person can edit it in Odoo)"
         if meta.get("readonly") and not create_only:
             return "is read-only in Odoo"
-        if ftype in ("one2many", "many2many", "many2one", "reference") and meta.get("relation"):
-            reason = self.model_read_block_reason(meta["relation"])
+        relation = meta.get("relation")
+        if ftype in ("one2many", "many2many", "many2one", "reference") and relation:
+            if self.model_read_block_reason(relation):
+                return f"points to a blocked model ({relation})"
+            if relation == "res.partner.bank":
+                return _BANK_FIELD
+            if relation == SERVER_ACTION_MODEL and NESTED_LINES.get((model, name)) != relation:
+                return f"points to a blocked model ({relation}): server actions can be added only inside an automation rule"
+        if model == "account.journal" and "bank" in name:
+            return _BANK_FIELD
+        if model == SETTINGS_MODEL:
+            reason = _settings_field_block_reason(name)
             if reason:
-                return f"points to a blocked model ({meta['relation']})"
+                return reason
         if name == "active" and not self.settings.mcp_allow_archive:
-            return "would archive/unarchive the record, which is disabled (MCP_ALLOW_ARCHIVE=false)"
+            return f"would archive or unarchive the record, and archiving is switched off for Claude. {self._elsewhere}"
         return None
 
     # -- methods ------------------------------------------------------------------------
@@ -470,11 +662,22 @@ class SafetyPolicy:
         label_low = (label or "").lower()
         if not re.fullmatch(r"[a-z][a-z0-9_]*", low):
             return MethodDecision(False, "private or invalid method name")
+        if model in LIMITED_BUTTONS:
+            if method not in LIMITED_BUTTONS[model]:
+                if any(part in low for part in _DELETE_PARTS):
+                    return MethodDecision(False, self._delete_reason())
+                return MethodDecision(False, _BUTTONS_REFUSED.get(model, _SETUP_BUTTONS_REFUSED))
+            for part in self._extra_blocked_methods:
+                if part and (part in low or fnmatch.fnmatch(f"{model}:{method}", part)):
+                    return MethodDecision(False, f"blocked by this server's configuration ({part})")
+            return MethodDecision(True)
         if low in HARD_BLOCKED_METHODS:
             if low in ARCHIVE_METHODS and self.settings.mcp_allow_archive:
                 pass
             elif low in ARCHIVE_METHODS:
-                return MethodDecision(False, "archiving is disabled (MCP_ALLOW_ARCHIVE=false)")
+                return MethodDecision(False, self._archive_reason())
+            elif low == "unlink":
+                return MethodDecision(False, self._delete_reason())
             else:
                 return MethodDecision(
                     False, f"'{method}' cannot be run as a button (use odoo_create / odoo_update / odoo_add_note instead)"
@@ -482,21 +685,24 @@ class SafetyPolicy:
         tokens = set(low.split("_"))
         for part in HARD_BLOCKED_METHOD_SUBSTRINGS:
             if part in low:
+                if part in _DELETE_PARTS:
+                    return MethodDecision(False, self._delete_reason())
                 return MethodDecision(False, f"methods containing '{part}' are permanently blocked")
         for part in HARD_BLOCKED_METHOD_TOKENS & tokens:
+            if part in _DELETE_TOKENS:
+                return MethodDecision(False, self._delete_reason())
             return MethodDecision(False, f"methods that '{part}' data are permanently blocked")
         for part in self._extra_blocked_methods:
             if part and (part in low or fnmatch.fnmatch(f"{model}:{method}", part)):
                 return MethodDecision(False, f"blocked by this server's configuration ({part})")
         if low in ARCHIVE_METHODS or "archive" in low or "restore" in tokens:
             if not self.settings.mcp_allow_archive:
-                return MethodDecision(False, "archiving is disabled (MCP_ALLOW_ARCHIVE=false)")
+                return MethodDecision(False, self._archive_reason())
         if not self.settings.mcp_allow_cancel_actions:
             for part in CANCEL_METHOD_PARTS:
                 if part in tokens or any(token.startswith(part) for token in tokens):
-                    return MethodDecision(
-                        False, f"cancel/reset-type actions ('{part}') are disabled (MCP_ALLOW_CANCEL_ACTIONS=false)"
-                    )
+                    phrase = _cancel_phrase(model, part)
+                    return MethodDecision(False, f"{phrase} is switched off for Claude. {self._elsewhere}")
         if not self.settings.mcp_allow_outbound_messages:
             for part in OUTBOUND_METHOD_PARTS:
                 if (
@@ -506,15 +712,17 @@ class SafetyPolicy:
                 ):
                     return MethodDecision(
                         False,
-                        f"actions that may e-mail/message people ('{part}') are disabled (MCP_ALLOW_OUTBOUND_MESSAGES=false)",
+                        f"Sending e-mails or messages to people ('{part}') is switched off for Claude. {self._elsewhere}",
                     )
         if not self.settings.mcp_allow_cancel_actions and _CANCEL_LABEL_RE.search(label_low):
             return MethodDecision(
-                False, f"the '{label}' button cancels/resets/reverses; disabled (MCP_ALLOW_CANCEL_ACTIONS=false)"
+                False,
+                f"The '{label}' button cancels, resets or reverses, which is switched off for Claude. {self._elsewhere}",
             )
         if not self.settings.mcp_allow_outbound_messages and _OUTBOUND_LABEL_RE.search(label_low):
             return MethodDecision(
-                False, f"the '{label}' button may e-mail/message people; disabled (MCP_ALLOW_OUTBOUND_MESSAGES=false)"
+                False,
+                f"The '{label}' button may e-mail or message people, which is switched off for Claude. {self._elsewhere}",
             )
         if not is_ui_button and f"{model}:{method}" not in self._extra_allowed_methods:
             return MethodDecision(
@@ -523,6 +731,95 @@ class SafetyPolicy:
                 "(call odoo_list_actions to see them)",
             )
         return MethodDecision(True)
+
+    def _archive_reason(self) -> str:
+        return f"Archiving is switched off for Claude. {self._elsewhere}"
+
+    def _delete_reason(self) -> str:
+        if self.settings.mcp_allow_archive:
+            return (
+                "Deleting is not possible through Claude. Archive the record instead (set active to false with "
+                "odoo_preview_update), or delete it in Odoo."
+            )
+        return "Deleting is not possible through Claude. Delete it in Odoo."
+
+    # -- automation rules ---------------------------------------------------------------
+
+    def automation_trigger_block_reason(self, trigger: object) -> str | None:
+        if trigger in AUTOMATION_TRIGGERS:
+            return None
+        why = _REFUSED_TRIGGERS.get(trigger) if isinstance(trigger, str) else None
+        return (
+            f"the trigger {trigger!r} is not allowed for automation rules made through Claude"
+            f"{f' (it {why})' if why else ''}. Allowed triggers: {', '.join(sorted(AUTOMATION_TRIGGERS))}"
+        )
+
+    def automation_action_block_reason(self, action: Mapping, *, trigger: object = None) -> str | None:
+        """Why an automation rule's action (its values as they will be after the change) is refused, or None."""
+        state = action.get("state")
+        name = action.get("name") or "an action"
+        if state not in AUTOMATION_ACTION_TYPES:
+            why = _REFUSED_ACTIONS.get(state) if isinstance(state, str) else None
+            what = why or f"has the type {state!r}"
+            return f"action '{name}' {what}, which automation rules made through Claude may not do. {_ALLOWED_ACTIONS_TEXT}"
+        if state == "object_write":
+            if (action.get("evaluation_type") or "value") != "value":
+                return (
+                    f"action '{name}' must set a fixed value (evaluation_type 'value'), never a Python expression "
+                    "or a sequence"
+                )
+            path = action.get("update_path")
+            if not isinstance(path, str) or not path.strip():
+                return f"action '{name}' must name the field to update in update_path, e.g. 'user_id'"
+            if "." in path:
+                return (
+                    f"action '{name}' may update only a field of the rule's own record, not one reached through "
+                    f"another record ('{path}')"
+                )
+        outbound = self.settings.mcp_allow_outbound_messages
+        if state == "mail_post" and (action.get("mail_post_method") or "email") != "note":
+            if not outbound:
+                return f"action '{name}' e-mails or messages people, which is switched off for Claude. {self._elsewhere}"
+            if trigger in _MESSAGE_TRIGGERS:
+                return (
+                    f"action '{name}' would answer messages with messages, which can start an endless e-mail loop "
+                    "with an auto-reply. Use an activity or an internal note instead."
+                )
+        if state == "followers" and not outbound:
+            return (
+                f"action '{name}' adds followers, and Odoo e-mails followers; that is switched off for Claude. "
+                f"{self._elsewhere}"
+            )
+        return None
+
+    # -- previews -----------------------------------------------------------------------
+
+    def change_warnings(self, model: str, mode: str, field_names: Iterable[str]) -> list[str]:
+        """Plain-language warnings for a preview of a change to the limited setup areas. Pure: no Odoo calls.
+
+        mode is 'create' or 'write' (also 'update'); field_names are the fields the change sets.
+        """
+        names = sorted({str(name) for name in field_names or ()})
+        if model == SETTINGS_MODEL:
+            groups = [name for name in names if name.startswith("group_")]
+            if groups:
+                return [f"Switches a feature on or off for every user in the company, not just you: {', '.join(groups)}."]
+            return []
+        if model == TEMPLATE_MODEL and mode != "create":
+            return ["Changes every e-mail Odoo sends with this template from now on, to every recipient."]
+        if model == AUTOMATION_MODEL:
+            if mode != "create" and names == ["active"]:
+                return [
+                    "Archiving stops the rule. Unarchiving starts it again: it then runs automatically on every "
+                    "matching record, without asking anyone."
+                ]
+            return ["This rule runs automatically from now on, on every matching record, without asking anyone first."]
+        if model in CREATE_ONLY_MODELS and mode == "create":
+            return [
+                "New accounting setup affects every future entry, and it cannot be changed through Claude afterwards. "
+                "Check the tax setup with your CA before approving."
+            ]
+        return []
 
     # -- context ------------------------------------------------------------------------------
 
@@ -540,6 +837,7 @@ class SafetyPolicy:
                 if key == "active_model":
                     # wizards change the records they are opened on, so those must be changeable
                     self.check_write(str(value))
+                    self.check_change(str(value), "write")
                 elif key in ("lang", "tz") and not (isinstance(value, str) and len(value) <= 64):
                     raise PolicyViolation(f"context {key} must be a short text value")
                 elif key in ("active_id",) and not _is_int(value):
@@ -568,6 +866,58 @@ class SafetyPolicy:
 
 
 _OUTBOUND_SUBSTRINGS = ("mail", "email", "sms", "whatsapp", "send")
+
+# Method names that ask to delete: the refusal then says what to do instead.
+_DELETE_PARTS = ("unlink", "delete", "purge")
+_DELETE_TOKENS = frozenset({"drop", "erase", "destroy", "wipe", "remove"})
+
+_SETUP_BUTTONS_REFUSED = (
+    "Buttons on accounting setup cannot be pressed through Claude: they change setup that entries already use. "
+    "Do it in Odoo."
+)
+_BANK_FIELD = (
+    "holds bank details, which Claude never sets: a wrong bank account sends money to the wrong place. "
+    "A person sets it in Odoo"
+)
+
+_CANCEL_PHRASES: dict[str, str] = {
+    "cancel": "Cancelling",
+    "close": "Closing",
+    "reverse": "Reversing",
+    "reversal": "Reversing",
+    "refund": "Refunds and credit notes",
+    "draft": "Resetting to draft",
+    "reset": "Resetting",
+    "unpost": "Un-posting",
+    "unreconcile": "Un-reconciling",
+    "unlock": "Unlocking",
+    "revert": "Reverting",
+    "refuse": "Refusing",
+    "reject": "Rejecting",
+    "lost": "Marking as lost",
+}
+
+
+def _cancel_phrase(model: str, part: str) -> str:
+    if part == "lost" and model == "crm.lead":
+        return "Marking leads lost"
+    return _CANCEL_PHRASES.get(part, f"'{part}' actions")
+
+
+def _settings_field_block_reason(name: str) -> str | None:
+    if name.startswith("module_"):
+        return (
+            "installs or removes an Odoo app, which can raise the Odoo bill and is hard to undo. A person installs "
+            "apps in Odoo"
+        )
+    if _IDENTITY_FIELD_RE.search(name):
+        return (
+            "is part of the company's identity (name, address, GSTIN/VAT, PAN, bank, logo, e-mail, phone). A person "
+            "changes it in Odoo, on the company"
+        )
+    if _SECURITY_SETTING_RE.search(name):
+        return "is a security, sign-in or audit setting. A person changes it in Odoo"
+    return None
 
 
 # Button captions are checked too, as phrases: "Create Draft" is fine, "Reset to Draft" is not.

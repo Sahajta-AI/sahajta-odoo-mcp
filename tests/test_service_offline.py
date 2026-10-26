@@ -365,7 +365,7 @@ async def test_update_is_refused_in_read_only_mode_and_on_readonly_models(fake):
         await make_service(fake, mcp_access_mode="read_only").update("crm.lead", [100], {"probability": 1}, None, None)
     with pytest.raises(PolicyViolation):
         await make_service(fake, mcp_readonly_models=["crm.*"]).preview_update("crm.lead", [100], {"probability": 1}, None)
-    with pytest.raises(PolicyViolation, match="MCP_WRITABLE_MODELS"):
+    with pytest.raises(PolicyViolation, match="list of records Claude may change"):
         await make_service(fake, mcp_writable_models=["project.task"]).preview_update("crm.lead", [100], {"probability": 1}, None)
     assert changes(fake) == []
 
@@ -464,18 +464,18 @@ async def test_action_preview_shows_odoo_confirmation_text(fake):
 @pytest.mark.parametrize(
     "method, needle",
     [
-        ("unlink", "cannot be run as a button"),
-        ("UNLINK", "cannot be run as a button"),
-        ("action_unlink_lines", "unlink"),
+        ("unlink", "Deleting is not possible through Claude"),
+        ("UNLINK", "Deleting is not possible through Claude"),
+        ("action_unlink_lines", "Deleting is not possible through Claude"),
         ("_action_confirm", "private"),
         ("_action_private", "private"),
         ("write", "cannot be run as a button"),
         ("copy", "cannot be run as a button"),
         ("message_post", "cannot be run as a button"),
         ("payment_action_capture", "capture"),
-        ("action_cancel", "MCP_ALLOW_CANCEL_ACTIONS"),
-        ("action_draft", "MCP_ALLOW_CANCEL_ACTIONS"),
-        ("action_quotation_send", "MCP_ALLOW_OUTBOUND_MESSAGES"),
+        ("action_cancel", "Cancelling is switched off for Claude"),
+        ("action_draft", "Resetting to draft is switched off for Claude"),
+        ("action_quotation_send", "Sending e-mails or messages to people"),
         ("action_hidden_helper", "not a button"),
         ("Action_Confirm", "not a button"),  # case games: not the button Odoo shows
         ("action_confirm ", "private or invalid"),
@@ -670,7 +670,7 @@ async def test_describe_model_hides_secrets_and_explains_write_rules(svc):
     assert "x_api_key" not in fields and "access_token" not in fields
     assert "message_ids" not in fields and "hidden_technical_fields" in out
     assert fields["name"]["ai_can_write"] is True and fields["name"]["required"] is True
-    assert fields["active"]["ai_can_write"] is False and "MCP_ALLOW_ARCHIVE" in fields["active"]["why_not"]
+    assert fields["active"]["ai_can_write"] is False and "archiving is switched off" in fields["active"]["why_not"]
     assert fields["x_cron_id"]["ai_can_write"] is False
     with pytest.raises(PolicyViolation):
         await svc.describe_model("res.users.apikeys", None, None)
@@ -797,3 +797,49 @@ async def test_audit_log_records_names_never_values(tmp_path, fake):
     entries = [json.loads(line) for line in text.splitlines()]
     assert entries[0]["tool"] == "odoo_update" and entries[0]["fields"] == ["description"] and entries[0]["ids"] == [100]
     assert entries[-1]["outcome"] == "blocked"
+
+
+# ======================================================================================= setup areas, end to end
+
+
+async def test_a_setting_is_changed_by_a_new_settings_record_then_save(setup_fake):
+    svc = make_service(setup_fake)
+    values = [{"group_analytic_accounting": True, "quotation_validity_days": 15}]
+    preview = await svc.preview_create("res.config.settings", values, None)
+    created = await svc.create("res.config.settings", values, None, preview["confirm_token"])
+    settings_id = created["created"][0]["id"]
+    # Odoo 19 draws the Save button in its web client, so it is not in the view: it is still allowed
+    preview = await svc.preview_action("res.config.settings", [settings_id], "execute", None)
+    await svc.run_action("res.config.settings", [settings_id], "execute", None, preview["confirm_token"])
+    assert [c.ids for c in setup_fake.calls_to("execute")] == [[settings_id]]
+    with pytest.raises(PolicyViolation, match="Save button"):
+        await svc.preview_action("res.config.settings", [settings_id], "action_open_template_user", None)
+    with pytest.raises(ValidationFailed, match="Odoo app"):
+        await svc.preview_create("res.config.settings", [{"module_crm": True}], None)
+    with pytest.raises(PolicyViolation, match="new settings record"):
+        await svc.preview_update("res.config.settings", [settings_id], {"quotation_validity_days": 30}, None)
+
+
+async def test_accounting_setup_changes_are_refused_before_anything_is_sent(setup_fake):
+    svc = make_service(setup_fake, mcp_require_preview=False, mcp_allow_archive=True)
+    with pytest.raises(PolicyViolation, match="past reports and GST returns"):
+        await svc.update("account.tax", [1], {"amount": 12.0}, None, None)
+    with pytest.raises(PolicyViolation, match="accounting setup"):
+        await svc.run_action("account.tax", [1], "action_archive", None, None)
+    assert changes(setup_fake) == []
+    created = await svc.create("account.tax", [{"name": "GST 5%", "amount": 5.0}], None, None)
+    assert created["created"][0]["id"]
+
+
+async def test_automation_rules_can_be_described_and_read_without_their_secrets(setup_fake):
+    svc = make_service(setup_fake)
+    out = await svc.describe_model("base.automation", None, None)
+    names = {f["name"] for f in out["fields"]}
+    assert {"trigger", "filter_domain", "action_server_ids"} <= names and not {"url", "webhook_uuid"} & names
+    assert out["ai_can_change_records"] is True
+    with pytest.raises(ValidationFailed, match="cannot group by 'webhook_uuid'"):
+        await svc.aggregate("base.automation", ["webhook_uuid"], None, None, None, None, False)
+    with pytest.raises(ValidationFailed, match="hidden for safety"):
+        await svc.read("ir.actions.server", [400], ["name", "code"])
+    rows = (await svc.read("ir.actions.server", [400], ["name", "state"]))["records"]
+    assert rows[0]["name"] == "Plan a call"
