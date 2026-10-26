@@ -59,9 +59,13 @@ class ConfirmationSigner:
             )
         if not self._state.claim_once(f"confirm:{token}", expires):
             raise ConfirmationRequired(
-                "this confirm_token was already used. Each approved preview applies exactly once; run the preview "
-                "again if the person wants to do it again."
+                "this confirm_token was already used, so nothing was changed now. Each approved preview applies at "
+                "most once. Before running the preview again, check in Odoo whether the earlier attempt went through."
             )
+
+    def release(self, token: str) -> bool:
+        """Makes a used token valid again, for a change Odoo provably did not apply. False if that failed."""
+        return self._state.release(f"confirm:{token}")
 
     def _mac(self, expires: int, payload: dict) -> str:
         digest = hmac.new(self._key, str(expires).encode() + b"|" + canonical(payload), hashlib.sha256).digest()

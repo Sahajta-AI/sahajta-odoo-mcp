@@ -36,7 +36,9 @@ Ground rules:
    odoo_count for "how many" and odoo_aggregate for totals. Check total_matching / has_more before claiming "all".
 3. Changing data (only if this server allows it): always call the matching odoo_preview_* tool first, show the
    person exactly what will change, wait for their explicit approval, then call the change tool with the same
-   arguments and the confirm_token. Never change records the person did not ask about.
+   arguments and the confirm_token. Never change records the person did not ask about. If a change fails, read
+   the error: "Nothing was changed" means it may be retried (with the same confirm_token when it says so); "may
+   already have applied" means tell the person and check in Odoo before doing it again.
 4. Workflow steps (confirm an order, validate a delivery, post an invoice) are buttons: use odoo_list_actions and
    odoo_run_action. Never try to set a 'state' field directly.
 5. Deleting records is impossible through this server. If asked, explain that and suggest doing it in Odoo.
@@ -101,7 +103,8 @@ def register_tools(mcp: MCPServer, get_service: ServiceGetter, settings: Setting
             ref = secrets.token_hex(4)
             logger.exception("unexpected error (ref %s)", ref)
             raise ToolError(
-                f"Unexpected server error (ref {ref}). If this was a change, check the record in Odoo before retrying."
+                f"Unexpected server error (ref {ref}). If this was a change, it may or may not have been applied: "
+                "check the record in Odoo before retrying."
             ) from exc
         return json.dumps(result, ensure_ascii=False, default=str)
 

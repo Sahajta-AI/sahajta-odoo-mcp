@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import email.utils
 import json
+import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -33,7 +36,22 @@ def sleeps(monkeypatch) -> list[float]:
         recorded.append(delay)
 
     monkeypatch.setattr(odoo_client.asyncio, "sleep", fake_sleep)
+    # jitter pinned to the middle of its range, so waits are exact (see test_retry_waits_are_jittered)
+    monkeypatch.setattr(odoo_client, "random", SimpleNamespace(uniform=lambda low, high: (low + high) / 2), raising=False)
     return recorded
+
+
+@pytest.fixture
+def jitter(monkeypatch) -> list[tuple]:
+    """Jitter always at the low end of its range; records each range asked for."""
+    asked: list[tuple] = []
+
+    def uniform(low, high):
+        asked.append((low, high))
+        return low
+
+    monkeypatch.setattr(odoo_client, "random", SimpleNamespace(uniform=uniform), raising=False)
+    return asked
 
 
 @pytest.fixture
@@ -328,7 +346,7 @@ async def test_jsonrpc_needs_a_database(router):
     assert info.value.kind == "config"
 
 
-async def test_auto_probe_retries_once_when_odoo_is_busy(router, sleeps):
+async def test_auto_probe_retries_when_odoo_is_busy(router, sleeps):
     # Odoo.com answers 429 when several requests arrive at once; that is not "no JSON-2 here"
     probe = router.post("/json/2/res.users/context_get").mock(
         side_effect=[httpx.Response(429, text="<html>Too Many Requests</html>"), httpx.Response(200, json={"uid": 7})]
@@ -467,7 +485,7 @@ async def test_jsonrpc_http_status_mapping(router, status, kind):
 
 
 @pytest.mark.parametrize("status", [429, 502, 503, 504])
-async def test_read_methods_are_retried_once_after_two_seconds(router, sleeps, status):
+async def test_read_methods_are_retried_after_a_busy_answer(router, sleeps, status):
     route = router.post("/json/2/res.partner/search_read").mock(
         side_effect=[httpx.Response(status, json={}), httpx.Response(200, json=[{"id": 1}])]
     )
@@ -477,13 +495,90 @@ async def test_read_methods_are_retried_once_after_two_seconds(router, sleeps, s
     assert sleeps == [2.0]
 
 
-async def test_read_retry_gives_up_after_the_second_failure(router, sleeps):
+async def test_read_retry_backs_off_and_gives_up_after_three_attempts(router, sleeps):
     route = router.post("/json/2/res.partner/read").mock(return_value=httpx.Response(503, json={}))
     async with httpx.AsyncClient() as http:
         with pytest.raises(OdooError) as info:
             await make_client(http).call("res.partner", "read", ids=[1])
     assert info.value.kind == "unavailable"
-    assert route.call_count == 2 and sleeps == [2.0]
+    assert route.call_count == 3 and sleeps == [2.0, 4.0]
+
+
+async def test_retry_waits_are_jittered(router, sleeps, jitter):
+    # parallel serverless instances turned away together must not all come back at the same moment
+    router.post("/json/2/res.partner/read").mock(return_value=httpx.Response(429, json={}))
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(OdooError):
+            await make_client(http).call("res.partner", "read", ids=[1])
+    assert jitter == [(0.7, 1.3), (0.7, 1.3)]  # +-30%
+    assert sleeps == pytest.approx([1.4, 2.8])
+
+
+async def test_retry_waits_at_least_as_long_as_retry_after(router, sleeps, jitter):
+    route = router.post("/json/2/res.partner/read").mock(
+        side_effect=[httpx.Response(429, json={}, headers={"Retry-After": "5"}), httpx.Response(200, json=[])]
+    )
+    async with httpx.AsyncClient() as http:
+        assert await make_client(http).call("res.partner", "read", ids=[1]) == []
+    assert route.call_count == 2 and sleeps == [5.0]
+
+
+async def test_retry_after_as_an_http_date_is_understood(router, sleeps, jitter):
+    when = email.utils.formatdate(time.time() + 6, usegmt=True)
+    router.post("/json/2/res.partner/read").mock(
+        side_effect=[httpx.Response(503, json={}, headers={"Retry-After": when}), httpx.Response(200, json=[])]
+    )
+    async with httpx.AsyncClient() as http:
+        await make_client(http).call("res.partner", "read", ids=[1])
+    assert 4.0 < sleeps[0] <= 6.0
+
+
+async def test_a_retry_after_longer_than_eight_seconds_is_not_waited_for(router, sleeps):
+    route = router.post("/json/2/res.partner/read").mock(
+        return_value=httpx.Response(429, json={}, headers={"Retry-After": "30"})
+    )
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(OdooError) as info:
+            await make_client(http).call("res.partner", "read", ids=[1])
+    assert info.value.kind == "rate_limited" and info.value.retry_after == 30.0
+    assert route.call_count == 1 and sleeps == []
+
+
+async def test_total_retry_waiting_stays_under_fifteen_seconds(router, sleeps):
+    route = router.post("/json/2/res.partner/read").mock(
+        return_value=httpx.Response(429, json={}, headers={"Retry-After": "8"})
+    )
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(OdooError):
+            await make_client(http).call("res.partner", "read", ids=[1])
+    assert route.call_count == 2 and sleeps == [8.0]  # a second 8 s wait would pass 15 s
+
+
+async def test_jsonrpc_busy_answers_carry_retry_after(router, sleeps):
+    def handler(request):
+        params = body_of(request)["params"]
+        if params["method"] == "authenticate":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": 7})
+        return httpx.Response(429, text="slow down", headers={"Retry-After": "3"})
+
+    router.post("/jsonrpc").mock(side_effect=handler)
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(OdooError) as info:
+            await make_client(http, protocol="jsonrpc").call("res.partner", "search_count", domain=[])
+    assert info.value.retry_after == 3.0
+    assert sleeps == [pytest.approx(3.45), pytest.approx(4.0)]
+
+
+async def test_auto_probe_backs_off_like_reads(router, sleeps):
+    busy = httpx.Response(429, text="<html>Too Many Requests</html>")
+    probe = router.post("/json/2/res.users/context_get").mock(
+        side_effect=[busy, busy, httpx.Response(200, json={"uid": 7})]
+    )
+    router.post("/json/2/res.partner/read").mock(return_value=httpx.Response(200, json=[]))
+    async with httpx.AsyncClient() as http:
+        client = make_client(http, protocol="auto", db=None)
+        await client.call("res.partner", "read", ids=[1])
+    assert client.protocol == "json2" and probe.call_count == 3 and sleeps == [2.0, 4.0]
 
 
 @pytest.mark.parametrize(
@@ -532,6 +627,87 @@ async def test_jsonrpc_reads_are_retried_too(router, sleeps):
     async with httpx.AsyncClient() as http:
         assert await make_client(http, protocol="jsonrpc").call("res.partner", "search_count", domain=[]) == 3
     assert state["object_calls"] == 2 and sleeps == [2.0]
+
+
+# ===================================================================================== did Odoo apply it?
+
+
+@pytest.mark.parametrize(
+    "failure, maybe_applied",
+    [
+        # never reached Odoo
+        (httpx.ConnectError("refused"), False),
+        (httpx.ConnectTimeout("no route"), False),
+        (httpx.PoolTimeout("pool full"), False),
+        # sent: Odoo may be working on it, or may have finished
+        (httpx.ReadTimeout("slow"), True),
+        (httpx.WriteTimeout("slow"), True),
+        (httpx.ReadError("reset"), True),
+        (httpx.RemoteProtocolError("Server disconnected without sending a response"), True),
+        # Odoo refused it or rolled its transaction back
+        (httpx.Response(429, json={}), False),
+        (httpx.Response(401, json={}), False),
+        (httpx.Response(403, json=odoo_error_body("odoo.exceptions.AccessError")), False),
+        (httpx.Response(404, json=odoo_error_body("odoo.exceptions.MissingError")), False),
+        (httpx.Response(400, json=odoo_error_body("werkzeug.exceptions.BadRequest")), False),
+        (httpx.Response(422, json=odoo_error_body("odoo.exceptions.ValidationError")), False),
+        (httpx.Response(422, json=odoo_error_body("odoo.exceptions.UserError")), False),
+        (httpx.Response(409, json=odoo_error_body("odoo.exceptions.ConcurrencyError")), False),
+        (httpx.Response(500, json=odoo_error_body("odoo.exceptions.LockError")), False),
+        (httpx.Response(500, json=odoo_error_body("odoo.exceptions.UserError")), False),
+        # unknown
+        (httpx.Response(500, json=odoo_error_body("builtins.ZeroDivisionError")), True),
+        (httpx.Response(500, text="<html>Internal Server Error</html>"), True),
+        (httpx.Response(502, text="Bad Gateway"), True),
+        (httpx.Response(503, text="Service Unavailable"), True),
+        (httpx.Response(504, text="Gateway Timeout"), True),
+        (httpx.Response(200, text="<html>half a page"), True),
+    ],
+    ids=lambda v: type(v).__name__ if isinstance(v, Exception) else getattr(v, "status_code", v),
+)
+async def test_errors_say_whether_odoo_may_have_applied_the_change(router, failure, maybe_applied):
+    kwargs = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+    router.post("/json/2/account.move/create").mock(**kwargs)
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(OdooError) as info:
+            await make_client(http).call("account.move", "create", vals_list=[{"move_type": "out_invoice"}])
+    assert info.value.maybe_applied is maybe_applied
+
+
+@pytest.mark.parametrize(
+    "failure, maybe_applied",
+    [
+        (httpx.ConnectError("refused"), False),
+        (httpx.ReadTimeout("slow"), True),
+        (httpx.Response(429, text="slow down"), False),
+        (httpx.Response(502, text="Bad Gateway"), True),
+        ({"code": 200, "message": "Odoo Server Error", "data": {"name": "odoo.exceptions.UserError", "message": "no"}}, False),
+        ({"code": 200, "message": "Odoo Server Error", "data": {"name": "builtins.RuntimeError", "message": "boom"}}, True),
+    ],
+    ids=["connect", "read-timeout", "429", "502", "user-error", "crash"],
+)
+async def test_jsonrpc_errors_say_whether_odoo_may_have_applied_the_change(router, failure, maybe_applied):
+    def handler(request):
+        payload = body_of(request)
+        if payload["params"]["method"] == "authenticate":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": 7})
+        if isinstance(failure, Exception):
+            raise failure
+        if isinstance(failure, dict):
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "error": failure})
+        return failure
+
+    router.post("/jsonrpc").mock(side_effect=handler)
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(OdooError) as info:
+            await make_client(http, protocol="jsonrpc").call("account.move", "create", vals_list=[{}])
+    assert info.value.maybe_applied is maybe_applied
+
+
+def test_refusals_before_sending_never_count_as_applied():
+    assert OdooError("refusing to send 'unlink' to Odoo", kind="access").maybe_applied is False
+    assert OdooError("ODOO_DB must be set", kind="config").maybe_applied is False
+    assert OdooError("anything else").maybe_applied is True  # when in doubt, assume it may have happened
 
 
 # ===================================================================================== concurrency gate

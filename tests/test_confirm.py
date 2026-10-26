@@ -170,3 +170,21 @@ def test_canonical_is_stable_and_compact():
     assert canonical({"b": 1, "a": [2, 1]}) == b'{"a":[2,1],"b":1}'
     # non-JSON values are stringified instead of crashing
     assert canonical({"s": {1}}) == b'{"s":"{1}"}'
+
+
+def test_a_released_token_can_be_used_again_once(signer):
+    # for a change Odoo provably did not apply: the person's approval is handed back
+    token = signer.issue(PAYLOAD)
+    signer.verify(token, PAYLOAD)
+    assert signer.release(token) is True
+    signer.verify(token, PAYLOAD)
+    with pytest.raises(ConfirmationRequired, match="already used"):
+        signer.verify(token, PAYLOAD)
+
+
+def test_already_used_message_says_nothing_changed_and_to_check_first(signer):
+    token = signer.issue(PAYLOAD)
+    signer.verify(token, PAYLOAD)
+    with pytest.raises(ConfirmationRequired) as info:
+        signer.verify(token, PAYLOAD)
+    assert "nothing was changed" in str(info.value) and "check in Odoo" in str(info.value)
