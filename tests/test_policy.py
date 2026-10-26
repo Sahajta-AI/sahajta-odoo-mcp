@@ -509,7 +509,7 @@ def test_archive_methods_need_the_archive_flag(method, rw):
 )
 def test_cancel_type_methods_need_the_cancel_flag(method, rw):
     decision = decide(rw, method)
-    assert decision.allowed is False and "is switched off for Claude. Do it in Odoo, or ask Pranamya." in decision.reason
+    assert decision.allowed is False and "is switched off for Claude. Do it in Odoo, or ask your administrator." in decision.reason
     assert decide(policy(mcp_access_mode="read_write", mcp_allow_cancel_actions=True), method).allowed is True
 
 
@@ -1071,7 +1071,7 @@ def test_refusals_never_name_operator_settings():
 
 def test_marking_leads_lost_names_what_is_off_and_what_to_do(rw):
     assert decide(rw, "action_set_lost", model="crm.lead").reason == (
-        "Marking leads lost is switched off for Claude. Do it in Odoo, or ask Pranamya."
+        "Marking leads lost is switched off for Claude. Do it in Odoo, or ask your administrator."
     )
     assert decide(rw, "action_set_lost", model="sale.order").reason.startswith("Marking as lost is switched off")
     assert policy(mcp_access_mode="read_write", mcp_admin_contact="Shubhang").method_decision(
@@ -1084,7 +1084,7 @@ def test_read_only_mode_says_what_is_off_and_what_to_do(ro):
         ro.check_write("crm.lead")
     assert str(info.value) == (
         "Blocked by safety policy: Changes are switched off for Claude: this connection is in read-only mode. "
-        "Do it in Odoo, or ask Pranamya."
+        "Do it in Odoo, or ask your administrator."
     )
 
 

@@ -43,17 +43,36 @@ indirectly are refused:
 
 **Secrets and system configuration** (never readable or writable): API keys and their wizards, password/2FA
 wizards, devices and login logs, `ir.config_parameter`, mail servers, IAP accounts, payment providers and tokens,
-settings (`res.config.settings`), server actions, scheduled actions, automation rules, access rules, record
-rules, module install/upgrade/uninstall, import, partner/data merge, logging, sessions and bus.
+server actions on their own, scheduled actions (`ir.cron`), access rules, record rules, module
+install/upgrade/uninstall, import, partner/data merge, logging, sessions and bus.
 
 **E-invoicing certificates and their private keys** (`certificate.*`) are blocked entirely.
 
-**Readable but never writable**: accounting configuration (chart of accounts, taxes, fiscal positions, journals,
-report definitions, reconciliation models, payment methods, decimal precision), bank-sync connections, Odoo's
+**Setup Claude may change, with limits** (each through preview + approval; the preview warns that the change is
+standing):
+* App settings (`res.config.settings`): a new settings record plus its Save button. Never `module_*` fields
+  (installing an app can raise the Odoo bill), company identity (name, GSTIN/VAT, PAN, address, bank, logo,
+  e-mail, phone) or security/sign-in settings. `group_*` fields switch a feature for all users and are flagged.
+* E-mail templates (`mail.template`): update only `subject`, `body_html`, `email_to`, `email_cc`, `partner_to`,
+  `use_default_to`, `reply_to`. No new templates; aliases stay read-only.
+* Automation rules (`base.automation`) without code: triggers that run no code (no on-change, webhook or on-delete
+  triggers); actions limited to updating a field with a fixed value (same field rules as a normal write), adding
+  followers, creating an activity, and posting a message or e-mail from a template (e-mail and followers need the
+  outbound switch). Filters must be literal domains. Python code, webhooks, SMS/WhatsApp and record creation are
+  refused; a rule that already contains code can't be edited through Claude. Scheduled actions stay closed.
+* Analytic distribution (`analytic_distribution` JSON on lines): existing analytic accounts, percentages above 0
+  and up to 100.
+* Accounting setup, create-only: accounts, taxes (with their lines), fiscal positions, reconciliation models and
+  journals can be created, never edited or archived (editing setup already used changes past reports and GST
+  returns). Journal bank fields stay closed.
+
+**Readable but never writable**: other accounting configuration (report definitions, payment methods, decimal
+precision), existing accounting setup (see above), bank details anywhere (any field pointing at a bank account),
+bank-sync connections, Odoo's
 own AI agents and prompts, e-mail digests and gateway settings, chat guests, public dashboard share links,
 countries, all technical `ir.*` models (views, menus, sequences, attachments…), users and
 groups (prevents privilege escalation and paid-seat creation), companies, currencies and rates, languages,
-mail templates, mail queue, followers, aliases, mass mailing, SMS, WhatsApp, postal mail, website code and pages,
+mail queue, followers, aliases, mass mailing, SMS, WhatsApp, postal mail, website code and pages,
 accounting lock dates.
 
 **Fields**: anything named like a password, secret, token, API key, private key, TOTP/OTP, credential, passkey,
