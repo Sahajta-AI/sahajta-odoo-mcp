@@ -7,6 +7,7 @@ to opt in, explicitly, to anything that changes data.
 from __future__ import annotations
 
 from typing import Annotated, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -70,6 +71,9 @@ class Settings(BaseSettings):
     mcp_reads_per_minute: int = Field(default=120, ge=1)
     mcp_writes_per_minute: int = Field(default=30, ge=1)
     mcp_audit_log_file: str | None = None
+    mcp_default_timezone: str = Field(
+        default="UTC", description="Time zone used when the Odoo user has none set, e.g. Asia/Kolkata."
+    )
 
     # --- HTTP / connector mode --------------------------------------------------------
     mcp_public_url: str | None = Field(default=None, description="Public https URL of this server, e.g. https://odoo-mcp.sahajta.ai")
@@ -118,6 +122,16 @@ class Settings(BaseSettings):
         value = value.strip().rstrip("/")
         if not value.startswith(("https://", "http://")):
             raise ValueError("ODOO_URL must start with https://")
+        return value
+
+    @field_validator("mcp_default_timezone")
+    @classmethod
+    def _check_timezone(cls, value: str) -> str:
+        value = value.strip() or "UTC"
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"MCP_DEFAULT_TIMEZONE {value!r} is not a time zone name such as Asia/Kolkata") from exc
         return value
 
     @model_validator(mode="after")

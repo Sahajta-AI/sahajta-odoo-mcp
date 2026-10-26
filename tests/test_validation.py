@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import math
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 
 from conftest import FakeOdoo, build_settings
 from sahajta_odoo_mcp.errors import OdooError, PolicyViolation, ValidationFailed
 from sahajta_odoo_mcp.policy import SafetyPolicy
-from sahajta_odoo_mcp.schema import SchemaCache
+from sahajta_odoo_mcp.schema import REFRESH_MIN_SECONDS, SchemaCache
+from sahajta_odoo_mcp.state import MemoryState
 from sahajta_odoo_mcp.validation import (
     MAX_DOMAIN_TERMS,
     MAX_IDS_PER_COMMAND,
@@ -24,10 +27,12 @@ from sahajta_odoo_mcp.validation import (
 pytestmark = pytest.mark.usefixtures("no_unlink_ever")
 
 
-def make_validator(fake: FakeOdoo | None = None, tz: str = "Europe/Berlin", **settings) -> Validator:
+def make_validator(
+    fake: FakeOdoo | None = None, tz: str = "Europe/Berlin", schema: SchemaCache | None = None, **settings
+) -> Validator:
     fake = fake or FakeOdoo()
     policy = SafetyPolicy(build_settings(mcp_access_mode="read_write", **settings))
-    return Validator(client=fake, schema=SchemaCache(), policy=policy, tz=tz)
+    return Validator(client=fake, schema=schema or SchemaCache(), policy=policy, tz=tz)
 
 
 @pytest.fixture
@@ -58,6 +63,34 @@ def test_user_zone_falls_back_to_utc():
     assert user_zone("Not/AZone") == ZoneInfo("UTC")
     assert user_zone("../../etc/passwd") == ZoneInfo("UTC")
     assert user_zone("Asia/Kolkata") == ZoneInfo("Asia/Kolkata")
+
+
+def test_user_zone_uses_the_default_when_the_user_has_none():
+    assert user_zone(None, "Asia/Kolkata") == ZoneInfo("Asia/Kolkata")
+    assert user_zone("", "Asia/Kolkata") == ZoneInfo("Asia/Kolkata")
+    assert user_zone("Not/AZone", "Asia/Kolkata") == ZoneInfo("Asia/Kolkata")
+    assert user_zone("Europe/Berlin", "Asia/Kolkata") == ZoneInfo("Europe/Berlin")  # the user's own zone wins
+    assert user_zone("", "Not/AZone") == ZoneInfo("UTC")
+    assert user_zone("", None) == ZoneInfo("UTC")
+
+
+async def test_validator_uses_the_default_time_zone(fake):
+    policy = SafetyPolicy(build_settings(mcp_access_mode="read_write"))
+    v = Validator(client=fake, schema=SchemaCache(), policy=policy, tz="", default_tz="Asia/Kolkata")
+    assert v.zone == ZoneInfo("Asia/Kolkata")
+    out = await v.normalize_domain("crm.lead", [["next_call_at", ">=", "2026-10-26 10:00:00"]])
+    assert out == [["next_call_at", ">=", "2026-10-26 04:30:00"]]
+
+
+def test_default_time_zone_setting(monkeypatch):
+    monkeypatch.delenv("MCP_DEFAULT_TIMEZONE", raising=False)
+    assert build_settings().mcp_default_timezone == "UTC"
+    monkeypatch.setenv("MCP_DEFAULT_TIMEZONE", "Asia/Kolkata")
+    assert build_settings().mcp_default_timezone == "Asia/Kolkata"
+    assert build_settings(mcp_default_timezone=" ").mcp_default_timezone == "UTC"
+    for bad in ("India", "../../etc/passwd"):
+        with pytest.raises(PydanticValidationError, match="MCP_DEFAULT_TIMEZONE"):
+            build_settings(mcp_default_timezone=bad)
 
 
 @pytest.mark.parametrize(
@@ -126,6 +159,79 @@ async def test_schema_cache_other_odoo_errors_propagate(fake):
     fake.errors[("crm.lead", "fields_get")] = OdooError("denied", kind="access")
     with pytest.raises(OdooError):
         await SchemaCache().fields(fake, "crm.lead")
+
+
+def shared_key(model: str) -> str:
+    return f"fields:https://odoo.example.com|testdb|7|{model}"
+
+
+async def stale_shared_state(fake: FakeOdoo, *models: str) -> MemoryState:
+    """Another server instance cached these models' fields in the shared (Redis) cache."""
+    state = MemoryState()
+    for model in models:
+        await SchemaCache(shared=state).fields(fake, model)
+    return state
+
+
+GSTIN = {"type": "char", "string": "GSTIN", "store": True, "readonly": False}
+
+
+@pytest.mark.parametrize("entry", ["domain", "dotted path", "field list", "values"])
+async def test_field_added_in_odoo_is_found_past_stale_caches(fake, entry):
+    state = await stale_shared_state(fake, "crm.lead", "res.partner")
+    fake.schema["crm.lead"]["x_gstin"] = dict(GSTIN)  # e.g. GST was enabled after caching
+    fake.schema["res.partner"]["x_gstin"] = dict(GSTIN)
+    v = make_validator(fake, schema=SchemaCache(shared=state))
+    calls = {
+        "domain": lambda: v.normalize_domain("crm.lead", [["x_gstin", "=", "29ABCDE1234F1Z5"]]),
+        "dotted path": lambda: v.normalize_domain("crm.lead", [["partner_id.x_gstin", "=", "29ABCDE1234F1Z5"]]),
+        "field list": lambda: v.check_field_names("crm.lead", ["name", "x_gstin"]),
+        "values": lambda: v.normalize_values("crm.lead", {"x_gstin": "29ABCDE1234F1Z5"}, mode="create"),
+    }
+    assert await calls[entry]()
+    model = "res.partner" if entry == "dotted path" else "crm.lead"
+    assert "x_gstin" in state.get_json(shared_key(model)), "the shared cache is updated too"
+    assert len([c for c in fake.calls_to("fields_get") if c.model == model]) == 2
+
+
+@pytest.mark.parametrize("entry", ["domain", "values"])
+async def test_choice_added_in_odoo_is_found_past_stale_caches(fake, entry):
+    state = await stale_shared_state(fake, "crm.lead")
+    fake.schema["crm.lead"]["priority"]["selection"].append(["4", "Urgent"])
+    v = make_validator(fake, schema=SchemaCache(shared=state))
+    if entry == "domain":
+        assert await v.normalize_domain("crm.lead", [["priority", "=", "Urgent"]]) == [["priority", "=", "4"]]
+    else:
+        assert await v.normalize_values("crm.lead", {"priority": "4"}, mode="create") == {"priority": "4"}
+    assert ["4", "Urgent"] in state.get_json(shared_key("crm.lead"))["priority"]["selection"]
+
+
+async def test_unknown_names_refetch_fields_at_most_once(fake):
+    state = await stale_shared_state(fake, "crm.lead")
+    v = make_validator(fake, schema=SchemaCache(shared=state))
+    for _ in range(3):
+        await rejected(v.normalize_domain("crm.lead", [["x_nope", "=", 1]]), "not a field")
+        await rejected(v.normalize_domain("crm.lead", [["priority", "=", "9"]]), "not a valid choice")
+        await rejected(v.check_field_names("crm.lead", ["x_nope"]), "not a field")
+        await rejected(v.normalize_values("crm.lead", {"priority": "9"}, mode="create"), "not a valid choice")
+    assert len(fake.calls_to("fields_get")) == 2  # the other instance's fetch, then a single refetch
+
+
+async def test_no_refetch_right_after_fetching_from_odoo(v, fake):
+    await rejected(v.normalize_domain("crm.lead", [["x_nope", "=", 1]]), "not a field")
+    await rejected(v.normalize_domain("crm.lead", [["priority", "=", "9"]]), "not a valid choice")
+    assert len(fake.calls_to("fields_get")) == 1
+
+
+async def test_refetch_is_allowed_again_after_the_quiet_period(fake):
+    cache = SchemaCache()
+    v = make_validator(fake, schema=cache)
+    await v.fields_of("crm.lead")
+    fake.schema["crm.lead"]["x_gstin"] = dict(GSTIN)
+    await rejected(v.check_field_names("crm.lead", ["x_gstin"]), "not a field")  # fetched moments ago
+    (key, (expires, fields, fetched)), = cache._data.items()
+    cache._data[key] = (expires, fields, fetched - REFRESH_MIN_SECONDS)
+    assert await v.check_field_names("crm.lead", ["x_gstin"]) == ["x_gstin"]
 
 
 # ================================================================================ field lists
@@ -273,6 +379,187 @@ async def test_domain_datetime_values_through_paths_are_converted(fake):
 
 async def test_domain_invalid_datetime_value_is_rejected(v):
     await rejected(v.normalize_domain("crm.lead", [["next_call_at", ">", "last tuesday"]]), "not a valid date/time")
+
+
+@pytest.mark.parametrize("day", ["0001-01-01", "9999-12-31"])
+async def test_domain_whole_day_at_the_calendar_edges_is_a_validation_error(fake, day):
+    v = make_validator(fake, tz="Asia/Kolkata")
+    await rejected(v.normalize_domain("crm.lead", [["next_call_at", "=", day]]), "not a valid date/time")
+
+
+# --------------------------------------------------------------------- whole days on datetime fields
+
+
+@pytest.fixture
+def ist(fake) -> Validator:
+    return make_validator(fake, tz="Asia/Kolkata")
+
+
+@pytest.mark.parametrize(
+    "operator, expected",
+    [
+        # 31 October in India runs from 2026-10-30 18:30 to 2026-10-31 18:30 UTC
+        ("<=", [["date_order", "<", "2026-10-31 18:30:00"]]),
+        (">", [["date_order", ">=", "2026-10-31 18:30:00"]]),
+        ("<", [["date_order", "<", "2026-10-30 18:30:00"]]),
+        (">=", [["date_order", ">=", "2026-10-30 18:30:00"]]),
+        ("=", ["&", ["date_order", ">=", "2026-10-30 18:30:00"], ["date_order", "<", "2026-10-31 18:30:00"]]),
+        ("=?", ["&", ["date_order", ">=", "2026-10-30 18:30:00"], ["date_order", "<", "2026-10-31 18:30:00"]]),
+        ("!=", ["!", "&", ["date_order", ">=", "2026-10-30 18:30:00"], ["date_order", "<", "2026-10-31 18:30:00"]]),
+    ],
+)
+async def test_domain_whole_day_on_a_datetime_field(ist, operator, expected):
+    assert await ist.normalize_domain("sale.order", [["date_order", operator, "2026-10-31"]]) == expected
+
+
+async def test_domain_whole_day_through_a_path_and_in_a_subdomain(ist):
+    out = await ist.normalize_domain("sale.order.line", [["order_id.date_order", "<=", "2026-10-31"]])
+    assert out == [["order_id.date_order", "<", "2026-10-31 18:30:00"]]
+    out = await ist.normalize_domain("crm.lead", [["partner_id", "any", [["create_date", "=", "2026-10-26"]]]])
+    assert out == [
+        ["partner_id", "any", ["&", ["create_date", ">=", "2026-10-25 18:30:00"], ["create_date", "<", "2026-10-26 18:30:00"]]]
+    ]
+
+
+async def test_domain_whole_day_follows_the_local_calendar_across_dst(fake):
+    v = make_validator(fake, tz="Europe/Berlin")  # 2026-10-25 has 25 hours in Berlin
+    assert await v.normalize_domain("crm.lead", [["create_date", "=", "2026-10-25"]]) == [
+        "&", ["create_date", ">=", "2026-10-24 22:00:00"], ["create_date", "<", "2026-10-25 23:00:00"],
+    ]
+
+
+async def test_domain_values_with_a_time_keep_their_meaning(ist):
+    assert await ist.normalize_domain("crm.lead", [["create_date", "=", "2026-10-26 10:00:00"]]) == [
+        ["create_date", "=", "2026-10-26 04:30:00"]
+    ]
+
+
+@pytest.mark.parametrize(
+    "term",
+    [
+        ["create_date", "in", ["2026-10-26"]],
+        ["create_date", "not in", ["2026-10-26 10:00:00", "2026-10-27"]],
+        ["create_date", "in", "2026-10-26"],
+        ["create_date", "=", ["2026-10-26"]],
+        ["create_date", "like", "2026-10-26"],
+    ],
+)
+async def test_domain_whole_days_need_a_range_for_other_operators(ist, term):
+    await rejected(ist.normalize_domain("crm.lead", [term]), "Use a range")
+
+
+def _matches(domain: list, record: dict) -> bool:
+    """Evaluates a normalised domain (prefix operators, implicit '&') on one record of UTC strings."""
+    compare = {
+        "=": lambda a, b: a == b, "!=": lambda a, b: a != b, "<": lambda a, b: a < b,
+        "<=": lambda a, b: a <= b, ">": lambda a, b: a > b, ">=": lambda a, b: a >= b,
+    }
+
+    def operand(pos: int) -> tuple[bool, int]:
+        element = domain[pos]
+        if element == "!":
+            result, pos = operand(pos + 1)
+            return not result, pos
+        if element in ("&", "|"):
+            left, pos = operand(pos + 1)
+            right, pos = operand(pos)
+            return (left and right) if element == "&" else (left or right), pos
+        field, operator, value = element
+        return compare[operator](record[field], value), pos + 1
+
+    pos, result = 0, True
+    while pos < len(domain):
+        found, pos = operand(pos)
+        result = result and found
+    return result
+
+
+@pytest.mark.parametrize(
+    "domain, wanted",
+    [
+        ([["create_date", "=", "2026-10-26"]], lambda d: d == 26),
+        ([["create_date", "!=", "2026-10-26"]], lambda d: d != 26),
+        (["!", ["create_date", "=", "2026-10-26"]], lambda d: d != 26),
+        (["!", ["create_date", "!=", "2026-10-26"]], lambda d: d == 26),
+        (["|", ["create_date", "=", "2026-10-24"], ["create_date", "=", "2026-10-26"]], lambda d: d in (24, 26)),
+        ([["create_date", "!=", "2026-10-26"], ["create_date", ">=", "2026-10-25"]], lambda d: d >= 25 and d != 26),
+        (["&", "!", ["create_date", "=", "2026-10-26"], ["create_date", "<=", "2026-10-26"]], lambda d: d <= 25),
+        (["|", "!", ["create_date", "<", "2026-10-27"], ["create_date", "=", "2026-10-24"]], lambda d: d == 24 or d >= 27),
+        ([["create_date", ">", "2026-10-25"], ["create_date", "<", "2026-10-27"]], lambda d: d == 26),
+    ],
+)
+async def test_domain_whole_days_keep_prefix_operators_correct(ist, domain, wanted):
+    out = await ist.normalize_domain("crm.lead", domain)
+    india = ZoneInfo("Asia/Kolkata")
+    for day in range(23, 29):
+        for local_time in ("00:00:00", "00:00:01", "12:00:00", "23:59:59"):
+            local = datetime.fromisoformat(f"2026-10-{day} {local_time}").replace(tzinfo=india)
+            record = {"create_date": local.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")}
+            assert _matches(out, record) == wanted(day), (local, out)
+
+
+# --------------------------------------------------------------------- choices (selection fields)
+
+
+PAYMENT_STATES = [
+    ["not_paid", "Not Paid"], ["in_payment", "In Payment"], ["paid", "Paid"], ["partial", "Partially Paid"],
+    ["reversed", "Reversed"],
+]
+
+
+@pytest.fixture
+def moves(fake) -> Validator:
+    fake.schema["account.move"] = {
+        "payment_state": {"type": "selection", "string": "Payment Status", "selection": PAYMENT_STATES, "store": True},
+        "x_twin": {"type": "selection", "string": "Twin", "selection": [["a", "Same"], ["b", "same"]], "store": True},
+    }
+    fake.schema["account.move.line"] = {
+        "move_id": {"type": "many2one", "string": "Journal Entry", "relation": "account.move", "store": True},
+    }
+    return make_validator(fake)
+
+
+@pytest.mark.parametrize(
+    "model, domain",
+    [
+        ("account.move", [["payment_state", "=", "unpaid"]]),
+        ("account.move", [["payment_state", "!=", "unpaid"]]),
+        ("account.move", [["payment_state", "in", ["paid", "unpaid"]]]),
+        ("account.move", [["payment_state", "not in", ["unpaid"]]]),
+        ("account.move", [["payment_state", "=?", "unpaid"]]),
+        ("account.move", [["x_twin", "=", "same"]]),  # the label fits two choices: no guessing
+        ("account.move.line", [["move_id.payment_state", "=", "unpaid"]]),
+        ("account.move.line", [["move_id", "any", [["payment_state", "=", "unpaid"]]]]),
+    ],
+)
+async def test_domain_wrong_choice_is_rejected_instead_of_matching_nothing(moves, model, domain):
+    await rejected(moves.normalize_domain(model, domain), "not a valid choice", "Valid values:")
+
+
+async def test_domain_wrong_choice_lists_the_valid_keys(moves):
+    await rejected(
+        moves.normalize_domain("account.move", [["payment_state", "=", "unpaid"]]),
+        "'unpaid' is not a valid choice", "'not_paid', 'in_payment', 'paid', 'partial', 'reversed'",
+    )
+
+
+@pytest.mark.parametrize(
+    "model, term, expected",
+    [
+        ("account.move", ["payment_state", "=", "not_paid"], ["payment_state", "=", "not_paid"]),
+        ("account.move", ["payment_state", "=", "Not Paid"], ["payment_state", "=", "not_paid"]),
+        ("account.move", ["payment_state", "!=", "partially paid"], ["payment_state", "!=", "partial"]),
+        ("account.move", ["payment_state", "in", ["PAID", "in_payment", False]], ["payment_state", "in", ["paid", "in_payment", False]]),
+        ("account.move", ["payment_state", "not in", ["Reversed"]], ["payment_state", "not in", ["reversed"]]),
+        ("account.move", ["payment_state", "=", False], ["payment_state", "=", False]),
+        ("account.move", ["payment_state", "in", []], ["payment_state", "in", []]),
+        ("account.move", ["payment_state", "ilike", "pai"], ["payment_state", "ilike", "pai"]),  # patterns are left alone
+        ("account.move.line", ["move_id.payment_state", "=", "Paid"], ["move_id.payment_state", "=", "paid"]),
+        ("crm.lead", ["kanban_level", "in", ["2", "one"]], ["kanban_level", "in", [2, 1]]),  # integer keys
+    ],
+)
+async def test_domain_choices_are_sent_as_their_keys(moves, model, term, expected):
+    assert await moves.normalize_domain(model, [term]) == [expected]
 
 
 @pytest.mark.parametrize(

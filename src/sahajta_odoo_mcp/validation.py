@@ -13,7 +13,7 @@ import difflib
 import json
 import math
 from collections import defaultdict
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -29,6 +29,9 @@ DOMAIN_OPERATORS = frozenset(
     }
 )
 RELATIONAL = frozenset({"many2one", "one2many", "many2many"})
+CHOICE_OPERATORS = frozenset({"=", "!=", "=?", "in", "not in"})  # operators that compare with selection keys
+DAY_OPERATORS = frozenset({"=", "!=", "=?", "<", "<=", ">", ">="})  # operators that accept a whole day
+_NO_CHOICE = object()
 MAX_DOMAIN_TERMS = 100
 MAX_PATH_DEPTH = 4
 MAX_NESTING = 3
@@ -47,11 +50,15 @@ def suggest(name: str, fields: dict[str, dict]) -> str:
     return f" Did you mean: {', '.join(candidates[:3])}?" if candidates else ""
 
 
-def user_zone(tz: str | None) -> ZoneInfo:
-    try:
-        return ZoneInfo(tz or "UTC")
-    except (ZoneInfoNotFoundError, ValueError):
-        return ZoneInfo("UTC")
+def user_zone(tz: str | None, default: str | None = "UTC") -> ZoneInfo:
+    """The Odoo user's time zone; default (MCP_DEFAULT_TIMEZONE) when it is empty or invalid, then UTC."""
+    for name in (tz, default):
+        if name:
+            try:
+                return ZoneInfo(name)
+            except (ZoneInfoNotFoundError, ValueError):
+                pass
+    return ZoneInfo("UTC")
 
 
 def to_utc_string(value: str, zone: ZoneInfo) -> str:
@@ -64,21 +71,37 @@ def to_utc_string(value: str, zone: ZoneInfo) -> str:
 
 
 class Validator:
-    def __init__(self, *, client: OdooClient, schema: SchemaCache, policy: SafetyPolicy, tz: str):
+    def __init__(
+        self, *, client: OdooClient, schema: SchemaCache, policy: SafetyPolicy, tz: str | None, default_tz: str = "UTC"
+    ):
         self.client = client
         self.schema = schema
         self.policy = policy
-        self.zone = user_zone(tz)
+        self.zone = user_zone(tz, default_tz)
 
-    async def fields_of(self, model: str) -> dict[str, dict]:
-        return await self.schema.fields(self.client, model)
+    async def fields_of(self, model: str, *, refresh: bool = False) -> dict[str, dict]:
+        return await self.schema.fields(self.client, model, refresh=refresh)
+
+    async def _fields_with(self, model: str, names: list) -> dict[str, dict]:
+        """Fields of model, asked again from Odoo once if a name is unknown: it may have been added since caching."""
+        fields = await self.fields_of(model)
+        if any(isinstance(name, str) and name not in fields for name in names):
+            fields = await self.fields_of(model, refresh=True)
+        return fields
+
+    async def _fresh_meta(self, model: str, name: str, meta: dict) -> dict:
+        """The field's metadata asked again from Odoo, e.g. for a choice added since caching."""
+        fresh = (await self.fields_of(model, refresh=True)).get(name)
+        return fresh if fresh and fresh.get("type") == meta.get("type") else meta
 
     # ------------------------------------------------------------------ field lists
 
     async def check_field_names(self, model: str, names: list[str]) -> list[str]:
         if not isinstance(names, list):
             raise ValidationFailed("fields must be a list of field names")
-        fields = await self.fields_of(model)
+        fields = await self._fields_with(
+            model, [n for n in names if isinstance(n, str) and n and "." not in n and not is_sensitive_field(n)]
+        )
         problems: list[str] = []
         seen: list[str] = []
         for name in names:
@@ -111,6 +134,8 @@ class Validator:
             fields = await self.fields_of(current)
             if is_sensitive_field(part):
                 raise ValidationFailed(f"'{path}' refers to a credential/secret field, which cannot be searched")
+            if part not in fields:
+                fields = await self.fields_of(current, refresh=True)
             if part not in fields:
                 raise ValidationFailed(f"'{part}' (in '{path}') is not a field of {current}.{suggest(part, fields)}")
             meta = fields[part]
@@ -148,28 +173,63 @@ class Validator:
                     f"unknown domain operator {operator!r}; use one of: {', '.join(sorted(DOMAIN_OPERATORS))}"
                 )
             operator = operator.lower()
-            _owner, meta = await self.resolve_path(model, path)
+            owner, meta = await self.resolve_path(model, path)
             if operator in ("any", "not any"):
                 if meta.get("type") not in RELATIONAL:
                     raise ValidationFailed(f"'{operator}' only works on relational fields, not '{path}'")
                 if _depth >= MAX_NESTING:
                     raise ValidationFailed("domain is nested too deeply")
                 value = await self.normalize_domain(meta["relation"], value, _depth + 1)
-            else:
-                value = self._domain_value(meta, value, path)
+            elif meta.get("type") == "selection" and operator in CHOICE_OPERATORS:
+                value = await self._domain_choices(owner, path, meta, value)
+            elif meta.get("type") == "datetime":
+                # one condition may become a prefix group ('&' or '!'), which stays a single operand
+                out.extend(self._datetime_terms(path, operator, value))
+                continue
             out.append([path, operator, value])
         return out
 
-    def _domain_value(self, meta: dict, value: Any, path: str) -> Any:
-        if meta.get("type") != "datetime":
-            return value
+    async def _domain_choices(self, owner: str, path: str, meta: dict, value: Any) -> Any:
+        """Selection keys only: an unknown key would silently match nothing. An exact label is mapped to its key."""
+        values = value if isinstance(value, (list, tuple)) else [value]
+        keys = [v if v is False or v is None else _choice(meta, v, by_label=True) for v in values]
+        if _NO_CHOICE in keys:
+            meta = await self._fresh_meta(owner, path.rsplit(".", 1)[-1], meta)
+            keys = [v if v is False or v is None else _choice(meta, v, by_label=True) for v in values]
+        bad = [v for v, key in zip(values, keys, strict=True) if key is _NO_CHOICE]
+        if bad:
+            raise ValidationFailed(f"'{path}': {bad[0]!r} is not a valid choice. Valid values: {_choices_shown(meta)}")
+        return keys if isinstance(value, (list, tuple)) else keys[0]
+
+    def _datetime_terms(self, path: str, operator: str, value: Any) -> list:
+        """Datetime conditions in UTC. A bare date (YYYY-MM-DD) means that whole day in the user's time zone."""
+        values = value if isinstance(value, (list, tuple)) else [value]
+        days = [_day(v) for v in values]
+        if any(days) and (operator not in DAY_OPERATORS or isinstance(value, (list, tuple))):
+            raise ValidationFailed(
+                f"'{path}' is a date-time, so '{operator}' with a date only is ambiguous. Use a range instead: "
+                f"[\"{path}\", \">=\", \"YYYY-MM-DD\"], [\"{path}\", \"<=\", \"YYYY-MM-DD\"]"
+            )
         try:
-            if isinstance(value, str) and value:
-                return to_utc_string(value, self.zone)
-            if isinstance(value, list):
-                return [to_utc_string(v, self.zone) if isinstance(v, str) and v else v for v in value]
-        except ValueError as exc:
+            if not any(days):
+                return [[path, operator, self._domain_value(value)]]
+            start = to_utc_string(days[0].isoformat(), self.zone)
+            end = to_utc_string((days[0] + timedelta(days=1)).isoformat(), self.zone)
+        except (ValueError, OverflowError) as exc:
             raise ValidationFailed(f"'{path}': {value!r} is not a valid date/time (use YYYY-MM-DD HH:MM:SS)") from exc
+        if operator in ("=", "=?"):
+            return ["&", [path, ">=", start], [path, "<", end]]
+        if operator == "!=":
+            return ["!", "&", [path, ">=", start], [path, "<", end]]
+        if operator in ("<", ">="):
+            return [[path, operator, start]]
+        return [[path, "<" if operator == "<=" else ">=", end]]
+
+    def _domain_value(self, value: Any) -> Any:
+        if isinstance(value, str) and value:
+            return to_utc_string(value, self.zone)
+        if isinstance(value, (list, tuple)):
+            return [to_utc_string(v, self.zone) if isinstance(v, str) and v else v for v in value]
         return value
 
     # ------------------------------------------------------------------ values for create / write
@@ -197,7 +257,7 @@ class Validator:
             raise ValidationFailed(f"values for {model} must be a non-empty object of field: value")
         if len(values) > MAX_VALUES_PER_RECORD:
             raise ValidationFailed(f"too many fields in one record (max {MAX_VALUES_PER_RECORD})")
-        fields = await self.fields_of(model)
+        fields = await self._fields_with(model, list(values))
         problems: list[str] = []
         out: dict = {}
         for name, value in values.items():
@@ -238,11 +298,13 @@ class Validator:
                 raise ValidationFailed(f"{label} is too long (max {MAX_STRING_CHARS} characters)")
             return value
         if ftype == "selection":
-            keys = [str(option[0]) for option in meta.get("selection") or [] if option]
-            if keys and str(value) not in keys:
-                shown = ", ".join(repr(k) for k in keys[:30])
-                raise ValidationFailed(f"{label}: {value!r} is not a valid choice. Valid values: {shown}")
-            return value if not keys else next(option[0] for option in meta["selection"] if str(option[0]) == str(value))
+            key = _choice(meta, value)
+            if key is _NO_CHOICE:
+                meta = await self._fresh_meta(model, name, meta)
+                key = _choice(meta, value)
+            if key is _NO_CHOICE:
+                raise ValidationFailed(f"{label}: {value!r} is not a valid choice. Valid values: {_choices_shown(meta)}")
+            return key
         if ftype == "boolean":
             if not isinstance(value, bool):
                 raise ValidationFailed(f"{label} must be true or false")
@@ -430,6 +492,35 @@ def _check_domain_arity(domain: list) -> None:
 
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _choice(meta: dict, value: Any, *, by_label: bool = False) -> Any:
+    """The selection key that value names, or _NO_CHOICE. Without a list of options, any value passes."""
+    options = [option for option in meta.get("selection") or [] if isinstance(option, (list, tuple)) and option]
+    if not options:
+        return value
+    for option in options:
+        if str(option[0]) == str(value):
+            return option[0]
+    if by_label and isinstance(value, str):
+        hits = [o[0] for o in options if len(o) > 1 and isinstance(o[1], str) and o[1].casefold() == value.casefold()]
+        if len(hits) == 1:
+            return hits[0]
+    return _NO_CHOICE
+
+
+def _choices_shown(meta: dict) -> str:
+    return ", ".join(repr(option[0]) for option in (meta.get("selection") or [])[:30] if option)
+
+
+def _day(value: Any) -> date | None:
+    """The date if value is a date without a time, such as '2026-10-31'."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value.strip())
+    except ValueError:
+        return None
 
 
 def _spend(refs: dict, label: str) -> None:
