@@ -43,8 +43,9 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _SCHEME = re.compile(r"[a-z][a-z0-9+.\-]*")
 
 GENERIC_FAILURE = (
-    "That login and API key did not work together. Check both, check that the key has not expired, and on "
-    "Odoo 20 or later that it was created with the RPC scope (keys made before upgrading must be recreated)."
+    "That login and API key did not work together. Check that the login is the email you sign in to Odoo with, "
+    "that you copied the whole key, and that the key has not expired. If Odoo asked for a scope when you made "
+    "the key, it must be RPC."
 )
 PORTAL_FAILURE = (
     "This Odoo account can't be used here. Only internal Odoo users (employees) can connect Claude, "
@@ -63,6 +64,7 @@ class LoginPage:
         self._logins = frozenset(x.strip().lower() for x in settings.mcp_allowed_logins if x.strip())
         self._read_only = not settings.read_write
         self._odoo_host = urlsplit(settings.odoo_url).netloc
+        self._odoo_url = settings.odoo_url.rstrip("/")
         self._secure_cookie = public_url.startswith("https://")
         self._cookie = "__Host-sahajta-oauth" if self._secure_cookie else "sahajta-oauth"
         self._ip_failures = SlidingWindow(MAX_FAILURES_PER_IP, IP_WINDOW_SECONDS)
@@ -229,16 +231,17 @@ class LoginPage:
          autocomplete="username" inputmode="email" autocapitalize="none" spellcheck="false"{"" if login else " autofocus"}>
   <label for="api_key">Odoo API key</label>
   <input id="api_key" name="api_key" type="password" required maxlength="256" autocomplete="off"{" autofocus" if login else ""}>
-  <details>
-    <summary>How do I create an API key?</summary>
+  <details open>
+    <summary>How do I get an API key?</summary>
     <ol>
-      <li>In Odoo, click your profile picture (top right) and open <strong>My Preferences</strong>
-          (called <strong>Preferences</strong> in some versions).</li>
+      <li><a href="{e(self._odoo_url)}/odoo" target="_blank" rel="noopener noreferrer">Open your Odoo</a>, click
+          your profile picture (top right) and open <strong>My Preferences</strong>.</li>
       <li>Open the <strong>Security</strong> tab (<strong>Account Security</strong> in older versions) and click
-          <strong>Create API Key</strong> (<strong>Add</strong> or <strong>New API Key</strong> in older versions).</li>
-      <li>Confirm your password, name the key (for example &ldquo;Claude&rdquo;) and choose how long it should last.
-          If Odoo asks for a <strong>scope</strong>, choose <strong>RPC</strong> (not MCP).</li>
-      <li>Copy the key and paste it above. Odoo shows it only once.</li>
+          <strong>New API Key</strong>.</li>
+      <li>Confirm your password and name the key, for example &ldquo;Claude&rdquo;. For how long it lasts, pick the
+          longest option Odoo offers you. When the key ends, Claude will ask you to connect again with a new one.
+          If Odoo asks for a <strong>scope</strong>, choose <strong>RPC</strong>.</li>
+      <li>Copy the key and paste it above. Odoo shows it only once, so keep it in your password manager.</li>
     </ol>
   </details>
   <div class="actions">
@@ -246,8 +249,8 @@ class LoginPage:
     <button type="submit">Sign in and connect</button>
   </div>
 </form>
-<footer class="muted">Your API key is stored encrypted on this server and used only for your requests.
-To disconnect Claude at any time, delete the key in Odoo under Account Security.</footer>
+<footer class="muted">Your API key is stored encrypted on this server, used only for your requests, and never
+shown to Claude. To disconnect Claude at any time, delete the key in Odoo under My Preferences &rarr; Security.</footer>
 """
         return HTMLResponse(
             _page("Connect Claude to Sahajta Odoo", body),
