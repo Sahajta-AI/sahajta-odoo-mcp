@@ -27,6 +27,7 @@ so Redis is required; the app refuses to start without it.
 | `MCP_ALLOW_ARCHIVE` | `true` lets Claude archive and unarchive records (with preview + approval). Default `false` |
 | `MCP_ALLOW_CANCEL_ACTIONS` | `true` lets Claude press cancel / reset to draft / mark lost buttons (with approval). Default `false` |
 | `MCP_TRUST_PROXY_HEADERS` | `true` |
+| `MCP_DEFAULT_TIMEZONE` | `Asia/Kolkata`: used when an Odoo user's profile has no time zone (otherwise UTC) |
 | `MCP_ADMIN_TOKEN` | random 40+ characters (sensitive): unlocks the usage report |
 | `REDIS_URL` / `KV_URL` | set automatically when Upstash Redis is connected to the project |
 
@@ -34,6 +35,12 @@ No Odoo API key is stored in Vercel. The person connecting types their login and
 the key is stored encrypted (with `MCP_SECRET`) in Redis.
 
 After changing a variable, redeploy for it to take effect.
+
+## Deploying a new version
+
+Run `scripts/deploy.sh` from the project folder. It deploys only from a clean `main` that is pushed to GitHub,
+stops if a secret from `.env` is in a tracked file, runs the tests, deploys, and then checks `/healthz`.
+GitHub also runs the tests on every push (Actions → tests).
 
 ## Connecting Claude
 

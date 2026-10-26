@@ -16,6 +16,7 @@ import time
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -31,7 +32,7 @@ from .odoo_client import OdooClient, OdooIdentity
 from .policy import CREATE_ONLY_FIELDS, SafetyPolicy, is_sensitive_field
 from .ratelimit import RateLimiter
 from .schema import SchemaCache
-from .validation import Validator, user_zone
+from .validation import Validator
 
 _ORDER_RE = re.compile(r"^\s*[a-z_][a-z0-9_]*(\s+(asc|desc))?(\s*,\s*[a-z_][a-z0-9_]*(\s+(asc|desc))?)*\s*$", re.I)
 _GROUPBY_RE = re.compile(r"^[a-z_][a-z0-9_]*(:(day|week|month|quarter|year))?$")
@@ -87,6 +88,11 @@ _KNOWN_WIZARDS = {
 }
 
 
+# When the current tool call began (set by tools.run), so the time budget also counts the sign-in
+# lookup a cold server instance does before the service exists.
+CALL_STARTED: ContextVar[float | None] = ContextVar("call_started", default=None)
+
+
 @dataclass
 class _Attempt:
     """One call of a change tool."""
@@ -119,9 +125,12 @@ class OdooService:
         self.policy = shared.policy
         self.client = client
         self.identity = identity
-        self.validator = Validator(client=client, schema=shared.schema, policy=shared.policy, tz=identity.tz)
+        self.validator = Validator(
+            client=client, schema=shared.schema, policy=shared.policy, tz=identity.tz,
+            default_tz=self.settings.mcp_default_timezone,
+        )
         self.fmt = Formatter(
-            zone=user_zone(identity.tz),
+            zone=self.validator.zone,
             max_text_chars=self.settings.mcp_max_text_chars,
             max_response_chars=self.settings.mcp_max_response_chars,
         )
@@ -153,7 +162,7 @@ class OdooService:
     @asynccontextmanager
     async def _change(self, tool: str, **audit):
         """_op for the change tools: every error leaving one says whether anything changed in Odoo."""
-        attempt = _Attempt(started=time.monotonic())
+        attempt = _Attempt(started=CALL_STARTED.get() or time.monotonic())
         try:
             self._require_read_write()
             async with self._op(tool, "write", **audit):
@@ -314,7 +323,7 @@ class OdooService:
     def _notes(self) -> list[str]:
         return [
             UNTRUSTED_NOTE,
-            f"Date-times are shown in the user's time zone ({self.identity.tz}).",
+            f"Date-times are shown in the user's time zone ({self.validator.zone.key}).",
         ]
 
     async def _context_defaults_check(self, model: str, ctx: dict) -> None:
@@ -408,7 +417,7 @@ class OdooService:
             return {
                 "user": {"id": self.identity.uid, "name": self.identity.name, "login": self.identity.login},
                 "company": self.identity.company_name,
-                "timezone": self.identity.tz,
+                "timezone": self.validator.zone.key,
                 "language": self.identity.lang,
                 "odoo": {"url": self.client.creds.url, "version": self.identity.server_version, "protocol": self.identity.protocol},
                 "permissions": {

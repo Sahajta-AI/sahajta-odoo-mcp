@@ -332,6 +332,18 @@ async def test_a_change_is_not_sent_once_the_call_has_used_20_seconds(svc, fake,
     assert len(changes(fake)) == 1
 
 
+async def test_the_time_budget_counts_from_the_start_of_the_tool_call(svc, fake, clock):
+    # tools.run marks the start before a cold instance spends time looking up the sign-in
+    commit = await approved(svc, "update")
+    token = service_module.CALL_STARTED.set(clock.t - 25)
+    try:
+        with pytest.raises(NotSent):
+            await commit()
+    finally:
+        service_module.CALL_STARTED.reset(token)
+    assert changes(fake) == []
+
+
 async def test_a_change_within_the_time_budget_is_sent(svc, fake, clock):
     commit = await approved(svc, "update")
     slow_odoo(fake, clock, 4)  # a few slow reads, still well inside 20 s

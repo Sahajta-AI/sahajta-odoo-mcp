@@ -94,7 +94,7 @@ a confirmed preview listing the recipients.
 | Prompt injection inside Odoo data (e.g. a lead description saying "archive all leads") | Results are labelled as untrusted data; no delete; archive/cancel/e-mail off; every change needs approval of a visible preview; caps |
 | Leaked connector URL | Useless without OAuth sign-in with a valid Odoo login + API key; tokens are short-lived (1 h) |
 | Stolen Claude session | Revoke the person's Odoo API key (immediate), or `python -m sahajta_odoo_mcp.oauth.admin revoke --login …` |
-| Malicious OAuth client / phishing | Redirect URIs restricted to Claude's callbacks and loopback; client metadata only fetched from claude.ai/claude.com; PKCE S256; single-use 5-minute codes; refresh-token rotation with replay detection; sign-in page cannot be framed |
+| Malicious OAuth client / phishing | Redirect URIs restricted to Claude's callbacks and loopback; client metadata only fetched from claude.ai/claude.com; PKCE S256; single-use 5-minute codes; refresh-token rotation with replay detection (a reuse within 120 s, e.g. a client retry, gets a fresh pair; later reuse revokes the sign-in); sign-in page cannot be framed |
 | Server compromise | Odoo keys encrypted at rest (Fernet, key derived from `MCP_SECRET`); only hashes of tokens stored; container runs as non-root with a read-only filesystem |
 | Brute force on sign-in | Per-request and per-IP failure limits; Odoo keys are 160-bit random |
 | Runaway agent loops | Per-person rate limits and size caps |

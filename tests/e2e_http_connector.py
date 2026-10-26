@@ -83,14 +83,11 @@ async def main():
 
         r1 = await h.post("/token", data=dict(grant_type="refresh_token", refresh_token=t["refresh_token"], client_id=client_id))
         ok(r1.status_code == 200 and r1.json()["refresh_token"] != t["refresh_token"], "refresh rotates")
+        # a client retry within the 120 s grace window gets a fresh pair; replay after it revokes (offline tests)
         r2 = await h.post("/token", data=dict(grant_type="refresh_token", refresh_token=t["refresh_token"], client_id=client_id))
-        ok(r2.status_code == 400, "old refresh token replay rejected")
+        ok(r2.status_code == 200 and r2.json()["refresh_token"] != r1.json()["refresh_token"], "quick retry of old refresh token tolerated")
         r3 = await h.post("/token", data=dict(grant_type="refresh_token", refresh_token=r1.json()["refresh_token"], client_id=client_id))
-        ok(r3.status_code == 400, "replay revoked the whole grant (new refresh token dead too)")
-        http = create_mcp_http_client(headers={"Authorization": f"Bearer {r1.json()['access_token']}"})
-        r = await h.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
-                         headers={"Authorization": f"Bearer {r1.json()['access_token']}", "Accept": "application/json, text/event-stream"})
-        ok(r.status_code == 401, "access token of revoked grant rejected")
+        ok(r3.status_code == 200, "grant still alive after a tolerated retry")
         # code replay: a second use of the same code fails AND kills the tokens issued from it
         post, verifier = await sign_in(h, client_id, LOGIN, KEY)
         code = urllib.parse.parse_qs(urllib.parse.urlparse(post.headers["location"]).query)["code"][0]

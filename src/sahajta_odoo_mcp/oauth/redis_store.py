@@ -182,7 +182,9 @@ def _float(value: str | None) -> float | None:
 class RedisOAuthStore:
     def __init__(self, url: str, *, prefix: str = "sahajta-odoo-mcp:", client: redis.Redis | None = None):
         self.prefix = prefix
-        self._r = client or redis.Redis.from_url(url, decode_responses=True, socket_timeout=5, health_check_interval=30)
+        self._r = client or redis.Redis.from_url(
+            url, decode_responses=True, socket_timeout=2, socket_connect_timeout=2, health_check_interval=30
+        )
         self._consume_code = self._r.register_script(_CONSUME_CODE)
         self._rotate_refresh = self._r.register_script(_ROTATE_REFRESH)
         self._revoke = self._r.register_script(_REVOKE)

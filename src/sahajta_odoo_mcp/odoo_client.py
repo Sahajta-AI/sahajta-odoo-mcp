@@ -214,7 +214,7 @@ class OdooClient:
                 uid=uid,
                 login=row.get("login") or "",
                 name=row.get("name") or "",
-                tz=(ctx.get("tz") if isinstance(ctx, dict) else None) or "UTC",
+                tz=(ctx.get("tz") if isinstance(ctx, dict) else None) or "",  # empty: MCP_DEFAULT_TIMEZONE applies
                 lang=(ctx.get("lang") if isinstance(ctx, dict) else None) or "en_US",
                 company_id=company[0] if company else None,
                 company_name=company[1] if company else None,

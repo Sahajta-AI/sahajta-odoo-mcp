@@ -7,6 +7,7 @@ from its evaluated signature.
 import json
 import logging
 import secrets
+import time
 from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 
@@ -17,7 +18,7 @@ from pydantic import Field
 
 from .config import Settings
 from .errors import OdooMCPError
-from .service import OdooService
+from .service import CALL_STARTED, OdooService
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,7 @@ Method = Annotated[str, Field(description="The button's method name from odoo_li
 
 def register_tools(mcp: MCPServer, get_service: ServiceGetter, settings: Settings) -> None:
     async def run(fn: Callable[[OdooService], Awaitable[Any]]) -> str:
+        started = CALL_STARTED.set(time.monotonic())
         try:
             service = await get_service()
             result = await fn(service)
@@ -106,6 +108,8 @@ def register_tools(mcp: MCPServer, get_service: ServiceGetter, settings: Setting
                 f"Unexpected server error (ref {ref}). If this was a change, it may or may not have been applied: "
                 "check the record in Odoo before retrying."
             ) from exc
+        finally:
+            CALL_STARTED.reset(started)
         return json.dumps(result, ensure_ascii=False, default=str)
 
     # ------------------------------------------------------------------ read tools

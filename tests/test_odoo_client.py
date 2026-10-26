@@ -875,7 +875,8 @@ async def test_identity_defaults_when_context_lacks_tz_and_lang(router):
         client = make_client(http)
         identity = await client.identity()
         await client.call("crm.lead", "read", ids=[1])
-    assert identity.tz == "UTC" and identity.lang == "en_US"
+    # no time zone in the profile: left empty so MCP_DEFAULT_TIMEZONE applies (see validation.user_zone)
+    assert identity.tz == "" and identity.lang == "en_US"
     assert "context" not in body_of(route.calls.last.request)
 
 
