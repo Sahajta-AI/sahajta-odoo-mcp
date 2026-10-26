@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import email.utils
 import hashlib
 import http.cookiejar
 import itertools
+import random
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -29,13 +32,18 @@ USER_AGENT = f"sahajta-odoo-mcp/{__version__}"
 # Last line of defence, independent of the policy module: these never leave this process.
 _NEVER_SENT = ("unlink", "uninstall", "sudo")
 
-# Read-only methods may be retried once when Odoo is busy; changes are never retried automatically.
+# Read-only methods are retried when Odoo is busy; changes are never retried automatically.
 _SAFE_TO_RETRY = frozenset(
     {
         "search", "search_read", "search_count", "read", "fields_get", "name_search", "get_views",
         "formatted_read_group", "read_group", "context_get", "default_get", "get_available_models",
     }
 )
+# Waits before the 2nd and 3rd attempt, each varied by +-30% so that parallel serverless instances
+# turned away together do not all come back at the same moment and collide again.
+_RETRY_WAITS = (2.0, 4.0)
+_MAX_WAIT = 8.0
+_MAX_TOTAL_WAIT = 15.0
 # Odoo Online's acceptable-use policy asks for throttled, non-parallel API calls; all users of one
 # Odoo share these gates.
 _GATES: dict[tuple[str, int, int], asyncio.Semaphore] = {}
@@ -149,17 +157,19 @@ class OdooClient:
         await self._ensure_protocol()
         if self._base_context:
             context = {**self._base_context, **(context or {})}
-        for attempt in (1, 2):
+        waited = 0.0
+        for attempt in itertools.count(1):
             try:
                 async with _gate(self.creds.url, self._max_parallel):
                     if self._protocol == "json2":
                         return await self._call_json2(model, method, ids=ids, context=context, kwargs=kwargs)
                     return await self._call_jsonrpc(model, method, ids=ids, context=context, kwargs=kwargs)
             except OdooError as exc:
-                if attempt == 1 and exc.kind in ("rate_limited", "unavailable") and method in _SAFE_TO_RETRY:
-                    await asyncio.sleep(2.0)
-                    continue
-                raise
+                wait = _retry_wait(exc, attempt, waited) if method in _SAFE_TO_RETRY else None
+                if wait is None:
+                    raise
+                await asyncio.sleep(wait)
+                waited += wait
         raise AssertionError("unreachable")
 
     async def identity(self) -> OdooIdentity:
@@ -252,7 +262,8 @@ class OdooClient:
         # login page, or a non-JSON page: all mean "no JSON-2 here". Anything else (busy, down, timeout,
         # network) says nothing about the route and is passed on as it is; reading Odoo.com's 429 as
         # "no JSON-2" once sent Odoo 19 users down the legacy path and signed them out.
-        for attempt in (1, 2):
+        waited = 0.0
+        for attempt in itertools.count(1):
             try:
                 async with _gate(self.creds.url, self._max_parallel):
                     probe = await self._call_json2("res.users", "context_get", ids=None, context=None, kwargs={})
@@ -260,8 +271,10 @@ class OdooClient:
                 self._probe_ctx = probe if isinstance(probe, dict) else None
                 return
             except OdooError as exc:
-                if attempt == 1 and exc.kind in ("rate_limited", "unavailable"):
-                    await asyncio.sleep(2.0)
+                wait = _retry_wait(exc, attempt, waited)
+                if wait is not None:
+                    await asyncio.sleep(wait)
+                    waited += wait
                     continue
                 route_missing = exc.status == 404 or (exc.status is not None and 300 <= exc.status < 400) or (
                     exc.status == 200 and exc.odoo_name is None
@@ -310,10 +323,8 @@ class OdooClient:
         url = f"{self.creds.url}/json/2/{model}/{method}"
         try:
             response = await self._http.post(url, json=body, headers=headers, timeout=self._timeout)
-        except httpx.TimeoutException as exc:
-            raise OdooError(f"{model}.{method} timed out", kind="timeout") from exc
         except httpx.HTTPError as exc:
-            raise OdooError(type(exc).__name__, kind="network") from exc
+            raise _transport_error(exc, f"{model}.{method}") from exc
         if response.status_code == 200:
             try:
                 return response.json()
@@ -358,14 +369,15 @@ class OdooClient:
                 headers={"User-Agent": USER_AGENT},
                 timeout=self._timeout,
             )
-        except httpx.TimeoutException as exc:
-            raise OdooError(f"{service}.{method} timed out", kind="timeout") from exc
         except httpx.HTTPError as exc:
-            raise OdooError(type(exc).__name__, kind="network") from exc
+            raise _transport_error(exc, f"{service}.{method}") from exc
         if response.status_code == 429:
-            raise OdooError("", kind="rate_limited", status=429)
+            raise OdooError("", kind="rate_limited", status=429, retry_after=_retry_after(response))
         if response.status_code in (502, 503, 504):
-            raise OdooError(f"HTTP {response.status_code}", kind="unavailable", status=response.status_code)
+            raise OdooError(
+                f"HTTP {response.status_code}", kind="unavailable", status=response.status_code,
+                retry_after=_retry_after(response),
+            )
         if response.status_code != 200:
             raise OdooError(f"HTTP {response.status_code}", kind="server", status=response.status_code)
         try:
@@ -421,7 +433,45 @@ def _json2_error(response: httpx.Response) -> OdooError:
         kind = "server"
     if kind == "server" and not message:
         message = f"HTTP {status}"
-    return OdooError(_clean_message(message), kind=kind, status=status, odoo_name=name or None)
+    return OdooError(
+        _clean_message(message), kind=kind, status=status, odoo_name=name or None, retry_after=_retry_after(response)
+    )
+
+
+def _transport_error(exc: httpx.HTTPError, what: str) -> OdooError:
+    """Only a failure to connect proves the request never reached Odoo; after that (a timeout while
+    waiting for the answer, a dropped connection) Odoo may have carried it out."""
+    sent = not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+    if isinstance(exc, httpx.TimeoutException):
+        return OdooError(f"{what} timed out", kind="timeout", maybe_applied=sent)
+    return OdooError(type(exc).__name__, kind="network", maybe_applied=sent)
+
+
+def _retry_after(response: httpx.Response) -> float | None:
+    """Seconds from a Retry-After header (a number or an HTTP date), if there is one."""
+    value = response.headers.get("retry-after", "").strip()
+    if value.isascii() and value.isdigit():
+        return float(value)
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
+
+
+def _retry_wait(exc: OdooError, attempt: int, waited: float) -> float | None:
+    """Seconds to wait before retrying a read Odoo turned away as busy, or None to give up."""
+    if exc.kind not in ("rate_limited", "unavailable") or attempt > len(_RETRY_WAITS):
+        return None
+    wait = _RETRY_WAITS[attempt - 1] * random.uniform(0.7, 1.3)
+    if exc.retry_after is not None:
+        if exc.retry_after > _MAX_WAIT:
+            return None  # Odoo wants a longer pause than the person should be kept waiting for
+        wait = max(wait, exc.retry_after * random.uniform(1.0, 1.3))  # never sooner than Odoo asked
+    wait = min(wait, _MAX_WAIT)
+    return wait if waited + wait <= _MAX_TOTAL_WAIT else None
 
 
 def _clean_message(message: str) -> str:

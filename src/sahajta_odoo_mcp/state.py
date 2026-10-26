@@ -10,6 +10,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
+import secrets
 import time
 import zlib
 from collections import defaultdict, deque
@@ -17,13 +19,22 @@ from typing import Protocol
 
 import redis
 
+from .errors import StateUnavailable
+
+logger = logging.getLogger(__name__)
+
 
 class SharedState(Protocol):
     def claim_once(self, key: str, expires_at: int) -> bool:
-        """True the first time `key` is claimed (until it expires), False afterwards."""
+        """True the first time `key` is claimed (until it expires), False afterwards.
+
+        Raises StateUnavailable when the store does not answer: a change must never run unmarked."""
+
+    def release(self, key: str) -> bool:
+        """Undoes a claim (for a change Odoo provably did not apply). False if that could not be done."""
 
     def hit(self, key: str, limit: int, window_seconds: int) -> bool:
-        """Counts one event; True while the count within the window is at most `limit`."""
+        """Counts one event; True while the count within the window is at most `limit` (or cannot be counted)."""
 
     def get_json(self, key: str):
         """A cached JSON value, or None."""
@@ -60,6 +71,10 @@ class MemoryState:
         self._claims[key] = expires_at
         return True
 
+    def release(self, key: str) -> bool:
+        self._claims.pop(key, None)
+        return True
+
     def hit(self, key: str, limit: int, window_seconds: int) -> bool:
         now = time.monotonic()
         window = self._hits[key]
@@ -77,17 +92,48 @@ class RedisState:
         self._prefix = prefix
 
     def claim_once(self, key: str, expires_at: int) -> bool:
-        digest = hashlib.sha256(key.encode()).hexdigest()
-        return bool(self._r.set(f"{self._prefix}once:{digest}", "1", nx=True, exat=max(expires_at, int(time.time()) + 1)))
+        name = self._once_name(key)
+        mark = secrets.token_hex(8)
+        try:
+            return bool(self._r.set(name, mark, nx=True, exat=max(expires_at, int(time.time()) + 1)))
+        except redis.RedisError as exc:
+            # The claim may have been stored even though the answer was lost; undo it (only if it is ours),
+            # or the retry this error asks for would be refused as "already used".
+            try:
+                if self._r.get(name) == mark:
+                    self._r.delete(name)
+            except redis.RedisError:
+                pass
+            logger.warning("shared store unavailable while claiming a single-use marker: %s", type(exc).__name__)
+            raise StateUnavailable(
+                "The server's shared store did not answer, so this approval could not be recorded. "
+                "Nothing was changed, please try again."
+            ) from exc
+
+    def release(self, key: str) -> bool:
+        try:
+            self._r.delete(self._once_name(key))
+            return True
+        except redis.RedisError as exc:
+            logger.warning("shared store unavailable while releasing a single-use marker: %s", type(exc).__name__)
+            return False
 
     def hit(self, key: str, limit: int, window_seconds: int) -> bool:
         bucket = int(time.time() // window_seconds)
         name = f"{self._prefix}rate:{hashlib.sha256(key.encode()).hexdigest()}:{bucket}"
-        with self._r.pipeline() as pipe:
-            pipe.incr(name)
-            pipe.expire(name, window_seconds * 2)
-            count, _ = pipe.execute()
+        try:
+            with self._r.pipeline() as pipe:
+                pipe.incr(name)
+                pipe.expire(name, window_seconds * 2)
+                count, _ = pipe.execute()
+        except redis.RedisError as exc:
+            # A rate limit protects Odoo from runaway loops; a store hiccup must not block people's work.
+            logger.warning("shared store unavailable, rate limit not applied: %s", type(exc).__name__)
+            return True
         return int(count) <= limit
+
+    def _once_name(self, key: str) -> str:
+        return f"{self._prefix}once:{hashlib.sha256(key.encode()).hexdigest()}"
 
     def get_json(self, key: str):
         try:
@@ -112,4 +158,7 @@ _MAX_CACHED_BYTES = 800_000  # stay well under Upstash's per-request size limit
 
 
 def redis_client(url: str) -> redis.Redis:
-    return redis.Redis.from_url(url, decode_responses=True, socket_timeout=5, health_check_interval=30)
+    # Short timeouts: every tool call waits on these, and a whole call must fit in 60 seconds on Vercel.
+    return redis.Redis.from_url(
+        url, decode_responses=True, socket_timeout=2, socket_connect_timeout=2, health_check_interval=30
+    )
