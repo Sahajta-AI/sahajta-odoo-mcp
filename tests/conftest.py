@@ -306,6 +306,10 @@ class FakeOdoo:
     action_results: dict[tuple[str, str], Any] = field(default_factory=dict)
     followers: list[dict] = field(default_factory=list)
     calls: list[Call] = field(default_factory=list)
+    # what Odoo's onchange fills in on a new record of a model (computed values such as totals or a journal)
+    filled: dict[str, dict] = field(default_factory=dict)
+    # has_access answers, (model, operation) -> bool; anything not listed is allowed
+    access: dict[tuple[str, str], bool] = field(default_factory=dict)
 
     instances = []  # class-level registry (not a dataclass field: no annotation)
 
@@ -408,7 +412,35 @@ class FakeOdoo:
         return copy.deepcopy(self.views.get(model, {"views": {}}))
 
     def _m_default_get(self, model, ids, context, fields=None):
-        return copy.deepcopy(self.defaults.get(model, {}))
+        from_context = {k[len("default_"):]: v for k, v in (context or {}).items() if k.startswith("default_")}
+        return copy.deepcopy({**self.defaults.get(model, {}), **from_context})
+
+    def _m_has_access(self, model, ids, context, operation=None):
+        return self.access.get((model, operation), True)
+
+    def _m_onchange(self, model, ids, context, values=None, field_names=None, fields_spec=None):
+        """A new record as Odoo's form would show it: values, then defaults, then what Odoo computes."""
+        merged = {**self._m_default_get(model, ids, context), **copy.deepcopy(self.filled.get(model, {})), **(values or {})}
+        meta = self.schema.get(model, {})
+        out = {}
+        for name, spec in (fields_spec or {}).items():
+            value = merged.get(name, False)
+            ftype = meta.get(name, {}).get("type")
+            relation = meta.get(name, {}).get("relation")
+            if ftype == "many2one" and isinstance(value, int) and not isinstance(value, bool) and spec.get("fields"):
+                value = {"id": value, "display_name": self._store(relation).get(value, {}).get("name")}
+            elif ftype in ("many2many", "one2many") and isinstance(value, list) and spec.get("fields"):
+                ids = [i for cmd in value for i in (cmd[2] if isinstance(cmd, list) and cmd[0] == 6 else [cmd] if isinstance(cmd, int) else [])]
+                rows = [{"id": i, **{f: self._store(relation).get(i, {}).get("name" if f == "display_name" else f, False)
+                                      for f in spec["fields"]}} for i in ids]
+                value = [[4, row["id"], row] for row in rows] or [cmd for cmd in value if isinstance(cmd, list) and cmd[0] == 0]
+            out[name] = value
+        return {"value": out}
+
+    def _m_web_save_multi(self, model, ids, context, vals_list=None, specification=None):
+        for rid, vals in zip(ids or [], vals_list or [], strict=True):
+            self.touch(model, rid, **{k: v for k, v in vals.items() if not isinstance(v, list)})
+        return [{"id": rid} for rid in ids or []]
 
     def _m_create(self, model, ids, context, vals_list=None, **kw):
         new_ids = []
