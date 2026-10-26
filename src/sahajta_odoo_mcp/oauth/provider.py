@@ -249,7 +249,7 @@ class OdooAuthProvider(OAuthAuthorizationServerProvider[StoredAuthCode, StoredRe
     ) -> str | None:
         """Creates the grant and a single-use code; returns the client redirect (None if already consumed)."""
         now = self._clock()
-        grant_id = secrets.token_urlsafe(16)
+        grant_id = secrets.token_hex(16)  # never starts with "-", so `admin revoke --grant <id>` always parses
         code = new_token()
         grant = Grant(
             grant_id=grant_id,

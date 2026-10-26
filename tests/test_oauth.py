@@ -1062,3 +1062,9 @@ def test_another_clients_token_cannot_be_revoked(env: Env):
     stranger = register_client_id(env)
     assert env.client.post("/revoke", data={"token": tokens["access_token"], "client_id": stranger}).status_code == 200
     assert call_whoami(env, tokens["access_token"]).status_code == 200
+
+
+def test_grant_ids_never_look_like_command_line_options(env: Env):
+    # `python -m sahajta_odoo_mcp.oauth.admin revoke --grant <id>` must accept every id, so none may start with "-"
+    _, tokens = connect(env)
+    assert re.fullmatch(r"[0-9a-f]{32}", verify(env, tokens["access_token"]).claims["grant_id"])

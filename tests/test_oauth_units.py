@@ -361,3 +361,4 @@ def test_store_refuses_newer_schema(tmp_path: Path):
         conn.execute("PRAGMA user_version = 99")
     with pytest.raises(RuntimeError, match="newer version"):
         OAuthStore(path)
+
