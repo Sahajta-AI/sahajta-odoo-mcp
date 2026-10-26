@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -18,8 +19,8 @@ from sahajta_odoo_mcp.oauth.clients import OdooOAuthClient, is_redirect_allowed,
 from sahajta_odoo_mcp.oauth.crypto import CsrfSigner, DecryptionError, Sealer, hash_token
 from sahajta_odoo_mcp.oauth.limits import SlidingWindow, client_ip
 from sahajta_odoo_mcp.oauth.login_page import _csp_origin
-from sahajta_odoo_mcp.oauth.provider import normalise_url
-from sahajta_odoo_mcp.oauth.store import Grant, NewTokens, OAuthStore, PendingAuthorization
+from sahajta_odoo_mcp.oauth.provider import OdooAuthProvider, normalise_url
+from sahajta_odoo_mcp.oauth.store import REFRESH_REUSE_GRACE_SECONDS, Grant, NewTokens, OAuthStore, PendingAuthorization
 
 SECRET = "unit-test-secret-" + "q" * 23
 
@@ -281,11 +282,11 @@ def test_store_lifecycle_and_purge(tmp_path: Path):
         assert store.consume_code("c1", now, tokens).value == "ok"
 
         # Nothing is purged while tokens are alive.
-        store.purge(now + 100)
+        assert store.purge(now + 100) == []
         assert store.get_grant("g1").active  # type: ignore[union-attr]
 
         # Once every token has expired the grant is dead: its key is wiped.
-        store.purge(now + 7201)
+        assert store.purge(now + 7201) == ["g1"]
         grant = store.get_grant("g1")
         assert grant is not None and not grant.active and grant.api_key_enc is None
         assert grant.revoked_reason == "expired"
@@ -296,6 +297,46 @@ def test_store_lifecycle_and_purge(tmp_path: Path):
         assert store.get_grant("g1") is None
     finally:
         store.close()
+
+
+def test_store_refresh_rotation_grace_and_replay(tmp_path: Path):
+    store = OAuthStore(tmp_path / "oauth.sqlite3")
+    try:
+        now = time.time()
+        store.insert_pending(_pending(now))
+        store.create_grant_with_code(pending_id_hash="p1", grant=_grant(now), code_hash="c1", code_expires_at=now + 300)
+        store.consume_code("c1", now, NewTokens("a1", now + 3600, "r1", now + 7200))
+        assert store.rotate_refresh_token("r1", now, NewTokens("a2", now + 3600, "r2", now + 7200)).value == "ok"
+        # Used again soon after (a retry, or two refreshes racing): a new pair, nothing revoked.
+        assert store.rotate_refresh_token("r1", now + 60, NewTokens("a3", now + 3600, "r3", now + 7200)).value == "reused"
+        assert store.get_token("r2", "refresh") is not None and store.get_token("r3", "refresh") is not None
+        assert store.get_grant("g1").active  # type: ignore[union-attr]
+        # The window counts from the rotation, not from the last reuse; after it, reuse kills the grant.
+        late = now + REFRESH_REUSE_GRACE_SECONDS + 1
+        assert store.rotate_refresh_token("r1", late, NewTokens("a4", now + 3600, "r4", now + 7200)).value == "replayed"
+        assert store.get_token("r2", "refresh") is None and not store.get_grant("g1").active  # type: ignore[union-attr]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("grant_url", "grant_db", "protocol", "settings_db", "same"),
+    [
+        ("https://odoo.example.com", None, "json2", "sahajta", True),  # ODOO_DB added later
+        ("https://odoo.example.com", "sahajta", "json2", None, True),
+        ("https://odoo.example.com", "old", "auto", "new", True),
+        ("https://odoo.example.com", None, "jsonrpc", "sahajta", True),
+        ("https://odoo.example.com", "sahajta", "jsonrpc", "sahajta", True),
+        ("https://odoo.example.com", "old", "jsonrpc", "new", False),
+        ("https://other.example.com", "sahajta", "json2", "sahajta", False),
+        ("https://other.example.com", None, "jsonrpc", None, False),
+    ],
+)
+def test_same_odoo(tmp_path: Path, grant_url: str, grant_db: str | None, protocol: str, settings_db: str | None, same: bool):
+    settings = _settings(tmp_path, odoo_db=settings_db, odoo_protocol=protocol)
+    provider = OdooAuthProvider(settings, httpx.AsyncClient(), None, Sealer(SECRET), public_url="https://mcp.example.com")  # type: ignore[arg-type]
+    grant = replace(_grant(time.time()), odoo_url=grant_url, odoo_db=grant_db)
+    assert provider._same_odoo(grant) is same
 
 
 def test_store_purges_expired_pending_requests(tmp_path: Path):

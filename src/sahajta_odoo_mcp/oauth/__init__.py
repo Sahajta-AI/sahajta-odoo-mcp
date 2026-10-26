@@ -31,7 +31,7 @@ from ..odoo_client import OdooCredentials
 from .clients import LOOPBACK_HOSTS, SCOPE
 from .crypto import MIN_SECRET_LENGTH, CsrfSigner, Sealer
 from .login_page import LoginPage
-from .provider import OdooAuthProvider, normalise_url
+from .provider import OdooAuthProvider, RevokeHook, normalise_url
 from .routes import build_routes
 from .store import OAuthStore
 
@@ -104,15 +104,16 @@ def database_path(settings: Settings) -> Path:
     return Path(settings.mcp_data_dir) / "oauth.sqlite3"
 
 
-def build_oauth(settings: Settings, http: httpx.AsyncClient) -> OAuthComponents:
+def build_oauth(settings: Settings, http: httpx.AsyncClient, *, on_revoke: RevokeHook | None = None) -> OAuthComponents:
+    """on_revoke(login, reason) is called after any grant is revoked (default: nothing)."""
     public_url = public_base_url(settings)
     secret = settings.mcp_secret.get_secret_value() if settings.mcp_secret else ""
     if len(secret) < MIN_SECRET_LENGTH:
         raise ValueError(f"MCP_SECRET must be a random string of at least {MIN_SECRET_LENGTH} characters")
 
     store = make_store(settings)
-    store.purge(time.time())
-    provider = OdooAuthProvider(settings, http, store, Sealer(secret), public_url=public_url)
+    provider = OdooAuthProvider(settings, http, store, Sealer(secret), public_url=public_url, on_revoke=on_revoke)
+    provider.purge(time.time())  # best-effort: a storage hiccup must not stop the instance from starting
     auth_settings = AuthSettings(
         issuer_url=public_url,  # type: ignore[arg-type]  # plain str: a prebuilt AnyHttpUrl gains a trailing slash
         resource_server_url=f"{public_url}/mcp",  # type: ignore[arg-type]

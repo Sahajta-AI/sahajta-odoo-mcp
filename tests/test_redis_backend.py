@@ -18,7 +18,7 @@ from sahajta_odoo_mcp.confirm import ConfirmationSigner
 from sahajta_odoo_mcp.errors import ConfirmationRequired, RateLimited
 from sahajta_odoo_mcp.oauth.crypto import hash_token
 from sahajta_odoo_mcp.oauth.redis_store import RedisOAuthStore
-from sahajta_odoo_mcp.oauth.store import NewTokens
+from sahajta_odoo_mcp.oauth.store import GRANT_GRACE_SECONDS, REFRESH_REUSE_GRACE_SECONDS, NewTokens
 from sahajta_odoo_mcp.ratelimit import RateLimiter
 from sahajta_odoo_mcp.state import RedisState
 
@@ -82,7 +82,7 @@ def test_redis_store_lifecycle_and_purge(redis_backend):
     assert store.get_token(hash_token("a"), "access") is None
 
 
-def test_redis_refresh_rotation_and_replay(redis_backend):
+def test_redis_refresh_rotation_grace_and_replay(redis_backend):
     store = _store(redis_backend)
     now = time.time()
     store.insert_pending(_pending(now))
@@ -90,7 +90,13 @@ def test_redis_refresh_rotation_and_replay(redis_backend):
     store.consume_code("c1", now, NewTokens("a1", now + 3600, "r1", now + 7200))
     assert store.rotate_refresh_token("r1", now, NewTokens("a2", now + 3600, "r2", now + 7200)).value == "ok"
     assert store.get_token("r2", "refresh") is not None
-    assert store.rotate_refresh_token("r1", now, NewTokens("a3", now + 3600, "r3", now + 7200)).value == "replayed"
+    # Used again soon after (a retry, or two refreshes racing): a new pair, nothing revoked.
+    assert store.rotate_refresh_token("r1", now + 60, NewTokens("a3", now + 3600, "r3", now + 7200)).value == "reused"
+    assert store.get_token("r2", "refresh") is not None and store.get_token("r3", "refresh") is not None
+    assert store.get_grant("g1").active
+    # The window counts from the rotation, not from the last reuse; after it, reuse kills the grant.
+    late = now + REFRESH_REUSE_GRACE_SECONDS + 1
+    assert store.rotate_refresh_token("r1", late, NewTokens("a4", now + 3600, "r4", now + 7200)).value == "replayed"
     assert store.get_token("r2", "refresh") is None and not store.get_grant("g1").active
 
 
@@ -100,13 +106,43 @@ def test_redis_purge_wipes_dead_grants_and_old_revocations(redis_backend):
     store.insert_pending(_pending(now))
     store.create_grant_with_code(pending_id_hash="p1", grant=_grant(now), code_hash="c1", code_expires_at=now + 300)
     store.consume_code("c1", now, NewTokens("a", now + 3600, "r", now + 7200))
-    store.purge(now + 100)
+    assert store.purge(now + 100) == []
     assert store.get_grant("g1").active
-    store.purge(now + 7201)
+    assert store.purge(now + 7201) == ["g1"]
     grant = store.get_grant("g1")
     assert not grant.active and grant.revoked_reason == "expired" and grant.api_key_enc is None
     store.purge(now + 91 * 24 * 3600)
     assert store.get_grant("g1") is None and store.list_grants(include_inactive=True) == []
+
+
+def test_redis_purge_cannot_revoke_a_grant_refreshed_meanwhile(redis_backend):
+    """Another instance refreshes while purge looks at the grant: the check and the revoke are one step."""
+    now = time.time()
+    purge_at = now + GRANT_GRACE_SECONDS + 3700  # the access token has expired, the refresh token has not
+    other_instance = _store(redis_backend)
+    refreshed = []
+
+    def refresh_elsewhere():
+        new = NewTokens("a2", purge_at + 3600, "r2", purge_at + 7200)
+        refreshed.append(other_instance.rotate_refresh_token("r1", purge_at, new).value)
+
+    class RefreshAfterSnapshot(fakeredis.FakeRedis):
+        def smembers(self, name):
+            members = super().smembers(name)
+            if ":gk:" in name and not refreshed:
+                refresh_elsewhere()  # lands between purge's look at the grant's keys and its decision
+            return members
+
+    store = RedisOAuthStore("redis://fake", client=RefreshAfterSnapshot(server=redis_backend, decode_responses=True))
+    store.insert_pending(_pending(now))
+    store.create_grant_with_code(pending_id_hash="p1", grant=_grant(now), code_hash="c1", code_expires_at=now + 300)
+    store.consume_code("c1", now, NewTokens("a1", now + 3600, "r1", now + GRANT_GRACE_SECONDS + 7200))
+    revoked = store.purge(purge_at)
+    if not refreshed:  # purge never exposed a gap, so the refresh simply comes after it
+        refresh_elsewhere()
+    assert refreshed == ["ok"]
+    assert store.get_grant("g1").active and store.get_token("r2", "refresh") is not None
+    assert revoked == []
 
 
 def test_redis_pending_requests(redis_backend):

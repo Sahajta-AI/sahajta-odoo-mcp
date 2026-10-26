@@ -106,7 +106,12 @@ def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
 
     settings.require_http_settings()
     shared = build_shared(settings, settings.mcp_secret.get_secret_value().encode(), http)
-    oauth = build_oauth(settings, shared.http)
+
+    def record_signout(login: str, reason: str) -> None:
+        # Every ended sign-in lands in the usage log, so the owners can be alerted.
+        shared.audit.record(user=login, uid=None, tool="signout", outcome="error", detail=reason)
+
+    oauth = build_oauth(settings, shared.http, on_revoke=record_signout)
     services: OrderedDict[str, tuple[float, OdooService]] = OrderedDict()
 
     async def get_service() -> OdooService:
@@ -118,20 +123,24 @@ def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
         hit = services.get(key)
         if hit and hit[0] > now:
             return hit[1]
+        login = str((token.claims or {}).get("login", "?"))
         try:
             creds = oauth.credentials_for(token)
-            client = OdooClient(
-                creds, shared.http, protocol=settings.odoo_protocol, timeout=settings.odoo_timeout_seconds,
-                max_parallel=settings.odoo_max_parallel_requests, cache=shared.state,
-            )
+        except OdooError as exc:
+            # Our own record says no (e.g. the token expired since the check a moment ago). Odoo was not asked,
+            # so this says nothing about the API key: revoke nothing.
+            shared.audit.record(user=login, uid=None, tool="connect", outcome="error", detail=f"{exc.kind}: {exc}")
+            raise ToolError(f"{exc}. Try again; if this keeps happening, reconnect the Odoo connector in Claude.") from exc
+        client = OdooClient(
+            creds, shared.http, protocol=settings.odoo_protocol, timeout=settings.odoo_timeout_seconds,
+            max_parallel=settings.odoo_max_parallel_requests, cache=shared.state,
+        )
+        try:
             identity = await client.identity()
         except OdooError as exc:
-            shared.audit.record(
-                user=str((token.claims or {}).get("login", "?")), uid=None, tool="connect", outcome="error",
-                detail=f"{exc.kind}: {exc}",
-            )
+            shared.audit.record(user=login, uid=None, tool="connect", outcome="error", detail=f"{exc.kind}: {exc}")
             if exc.kind == "auth":
-                # The Odoo key was revoked or expired: end this sign-in so Claude asks the person to reconnect.
+                # Odoo itself rejected the key (revoked or expired): end this sign-in so Claude asks the person to reconnect.
                 oauth.revoke(token, "Odoo rejected the API key")
                 raise ToolError(f"{exc}. Reconnect the Odoo connector in Claude.") from exc
             raise ToolError(f"{exc}. Nothing was changed; try again in a moment.") from exc

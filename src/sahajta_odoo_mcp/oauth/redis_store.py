@@ -24,7 +24,7 @@ import logging
 import redis
 
 from .store import ExchangeResult, Grant, NewTokens, PendingAuthorization, StoredCode, StoredToken
-from .store import GRANT_GRACE_SECONDS, REVOKED_GRANT_RETENTION_SECONDS
+from .store import GRANT_GRACE_SECONDS, REFRESH_REUSE_GRACE_SECONDS, REVOKED_GRANT_RETENTION_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -76,22 +76,24 @@ insert_tokens(gid, ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6])
 return 'ok'
 """
 
-# Same ARGV ; KEYS[1] = old refresh token key
+# Same ARGV ; KEYS[1] = old refresh token key. Reuse within the grace window gets a new pair ('reused').
 _ROTATE_REFRESH = _LUA_HELPERS + """
 local now = tonumber(ARGV[2])
 local old = KEYS[1]
 if redis.call('EXISTS', old) == 0 then return 'invalid' end
 local gid = redis.call('HGET', old, 'grant_id')
 if not active(gid) then return 'invalid' end
-if redis.call('HEXISTS', old, 'rotated_at') == 1 then
+local rotated_at = tonumber(redis.call('HGET', old, 'rotated_at'))
+if rotated_at and now - rotated_at > %(grace)d then
   revoke(gid, 'refresh token reused', ARGV[2])
   return 'replayed'
 end
 if tonumber(redis.call('HGET', old, 'expires_at')) <= now then return 'invalid' end
-redis.call('HSET', old, 'rotated_at', ARGV[2])
 insert_tokens(gid, ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6])
+if rotated_at then return 'reused' end
+redis.call('HSET', old, 'rotated_at', ARGV[2])
 return 'ok'
-"""
+""" % {"grace": REFRESH_REUSE_GRACE_SECONDS}
 
 # ARGV: prefix, grant_id, reason, now
 _REVOKE = _LUA_HELPERS + """
@@ -121,6 +123,33 @@ redis.call('HSET', code, 'grant_id', gid, 'redirect_uri', redirect_uri, 'redirec
 redis.call('PEXPIREAT', code, math.floor(tonumber(ARGV[6]) * 1000))
 redis.call('SADD', p .. 'gk:' .. gid, code)
 return 1
+"""
+
+# ARGV: prefix, grant_id, now. Drops the grant's expired keys and, if nothing usable is left, revokes it,
+# in one step: a refresh on another instance cannot land between the check and the revoke.
+_PURGE_GRANT = _LUA_HELPERS + """
+local gid = ARGV[2]
+local now = tonumber(ARGV[3])
+if not active(gid) then return 0 end
+local gk = p .. 'gk:' .. gid
+local alive = false
+for _, key in ipairs(redis.call('SMEMBERS', gk)) do
+  local f = redis.call('HMGET', key, 'expires_at', 'used_at', 'rotated_at')
+  local expires = tonumber(f[1])
+  local is_code = string.find(key, ':code:', 1, true) ~= nil
+  if expires == nil then
+    redis.call('SREM', gk, key)
+  elseif expires <= now and not is_code then
+    redis.call('DEL', key)
+    redis.call('SREM', gk, key)
+  elseif expires <= now and not f[2] then
+    redis.call('SREM', gk, key)  -- an expired, unused code can never be exchanged
+  elseif (is_code and not f[2]) or (not is_code and not f[3]) then
+    alive = true
+  end
+end
+if alive then return 0 end
+return revoke(gid, 'expired', ARGV[3])
 """
 
 # ARGV: prefix, now ; KEYS[1] = grant key
@@ -158,6 +187,7 @@ class RedisOAuthStore:
         self._rotate_refresh = self._r.register_script(_ROTATE_REFRESH)
         self._revoke = self._r.register_script(_REVOKE)
         self._create_grant = self._r.register_script(_CREATE_GRANT)
+        self._purge_grant = self._r.register_script(_PURGE_GRANT)
         self._touch = self._r.register_script(_TOUCH)
         self._pending_failure = self._r.register_script(_PENDING_FAILURE)
 
@@ -338,9 +368,11 @@ class RedisOAuthStore:
 
     # ------------------------------------------------------------------ housekeeping
 
-    def purge(self, now: float) -> None:
+    def purge(self, now: float) -> list[str]:
+        """Deletes expired records and revokes grants that can never be used again; returns their ids."""
         self._r.zremrangebyscore(self._k("pending_idx"), "-inf", now)
         self._r.zremrangebyscore(self._k("clients"), "-inf", now - CLIENT_TTL_SECONDS)
+        revoked: list[str] = []
         for grant_id in list(self._r.smembers(self._k("grants"))):
             grant = self.get_grant(grant_id)
             if grant is not None and grant.revoked_at is not None and grant.revoked_at <= now - REVOKED_GRANT_RETENTION_SECONDS:
@@ -354,21 +386,10 @@ class RedisOAuthStore:
             if not grant.active or grant.created_at > now - GRANT_GRACE_SECONDS:
                 continue
             # A grant with no unused code and no live, unrotated token can never be used again: wipe its key.
-            alive = False
-            for key in self._r.smembers(self._k("gk", grant_id)):
-                row = self._r.hgetall(key)
-                if row and ":code:" not in key and float(row.get("expires_at") or 0) <= now:
-                    self._r.delete(key)  # expired token (Redis would drop it at the same moment)
-                    row = {}
-                if row and ":code:" in key and float(row.get("expires_at") or 0) <= now and not row.get("used_at"):
-                    row = {}  # an expired, unused code can never be exchanged
-                if not row:
-                    self._r.srem(self._k("gk", grant_id), key)
-                    continue
-                if (":code:" in key and not row.get("used_at")) or (":tok:" in key and not row.get("rotated_at")):
-                    alive = True
-            if not alive:
-                self.revoke_grant(grant_id, "expired", now)
+            if int(self._purge_grant(args=[self.prefix, grant_id, now])) == 1:
+                logger.info("Revoked grant %s (expired)", grant_id)
+                revoked.append(grant_id)
+        return revoked
 
 
 def _token_args(tokens: NewTokens) -> list:
