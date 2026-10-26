@@ -81,8 +81,8 @@ _KIND_BY_NAME = {
     "UserError": "user_error",
     "ValidationError": "validation",
     "RedirectWarning": "user_error",
-    "LockError": "user_error",
-    "ConcurrencyError": "user_error",
+    "LockError": "busy",
+    "ConcurrencyError": "busy",
     "SessionExpiredException": "auth",
     # Odoo 19 reports bad field names / bad arguments as plain Python errors (HTTP 500).
     "ValueError": "validation",
@@ -448,7 +448,7 @@ def _json2_error(response: httpx.Response) -> OdooError:
     elif status in (502, 503, 504):
         kind = "unavailable"
     elif status == 409:
-        kind = "user_error"
+        kind = "busy"  # another change to the same record: Odoo rolled this one back
     elif status in (400, 422):
         kind = _KIND_BY_NAME.get(short, "validation")
     elif short in _KIND_BY_NAME:

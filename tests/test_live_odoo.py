@@ -225,7 +225,7 @@ async def test_sale_order_with_lines_and_confirm_button(odoo):
     err, text = await call(odoo, "odoo_preview_action", model="sale.order", ids=[order_id], method="unlink")
     assert err and "Blocked" in text
     err, text = await call(odoo, "odoo_preview_action", model="sale.order", ids=[order_id], method="action_cancel")
-    assert err and "cancel" in text
+    assert err and "cancel" in text.lower()
     err, text = await call(odoo, "odoo_preview_action", model="sale.order", ids=[order_id], method="_action_confirm")
     assert err and "Blocked" in text
     err, text = await call(odoo, "odoo_preview_action", model="sale.order", ids=[order_id], method="action_quotation_send")

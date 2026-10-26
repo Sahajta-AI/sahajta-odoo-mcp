@@ -133,7 +133,7 @@ def slow_odoo(fake: FakeOdoo, clock, seconds: float) -> None:
     [
         OdooError("", kind="rate_limited", status=429),
         OdooError("ConnectError", kind="network", maybe_applied=False),
-        OdooError("Record is being edited by someone else", kind="user_error", status=409),
+        OdooError("Record is being edited by someone else", kind="busy", status=409),
         OdooError("You cannot do that", kind="validation", status=422),
     ],
     ids=["429", "connect", "concurrency", "validation"],
@@ -143,7 +143,9 @@ async def test_a_change_odoo_turned_away_can_be_retried_with_the_same_token(svc,
     fake.errors[WRITES[tool]] = refusal
     with pytest.raises(OdooError) as info:
         await commit()
-    assert str(info.value).endswith(RETRY_SAME_TOKEN)
+    # Odoo refusing the values themselves: retrying as is would be refused again, so no retry hint
+    expected = "Nothing was changed." if refusal.kind == "validation" else RETRY_SAME_TOKEN
+    assert str(info.value).endswith(expected)
     del fake.errors[WRITES[tool]]
     await commit()  # the same approval works once Odoo accepts it
     assert len(fake.calls_to(WRITES[tool][1])) == 2

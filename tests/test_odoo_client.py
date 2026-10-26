@@ -170,7 +170,7 @@ async def test_json2_non_json_200_is_a_server_error(router):
         (403, "odoo.exceptions.AccessError", "access"),
         (404, "odoo.exceptions.MissingError", "missing"),
         (404, "werkzeug.exceptions.NotFound", "missing"),
-        (409, "odoo.exceptions.ConcurrencyError", "user_error"),
+        (409, "odoo.exceptions.ConcurrencyError", "busy"),
         (422, "odoo.exceptions.UserError", "user_error"),
         (422, "odoo.exceptions.ValidationError", "validation"),
         (422, "odoo.exceptions.RedirectWarning", "user_error"),

@@ -58,7 +58,7 @@ class StateUnavailable(OdooMCPError):
 
 
 # Failures where Odoo refused the request or rolled its transaction back: nothing was applied.
-_NOT_APPLIED_KINDS = frozenset({"auth", "access", "user_error", "validation", "missing", "rate_limited", "config"})
+_NOT_APPLIED_KINDS = frozenset({"auth", "access", "user_error", "validation", "missing", "rate_limited", "busy", "config"})
 
 
 class OdooError(OdooMCPError):
@@ -110,6 +110,7 @@ class OdooError(OdooMCPError):
             "network": "Could not reach Odoo",
             "timeout": "Odoo did not answer in time",
             "rate_limited": "Odoo is rate limiting requests; wait a minute and retry",
+            "busy": "Someone else was changing the same record in Odoo at that moment",
             "unavailable": "Odoo is temporarily unavailable; try again shortly",
             "server": "Odoo reported an internal error",
             "config": "The connector's server settings are incomplete",

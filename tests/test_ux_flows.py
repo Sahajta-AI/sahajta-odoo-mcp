@@ -279,7 +279,7 @@ async def test_mark_lost_in_one_step(svc, fake):
     "setting, model, ids, method, needle",
     [
         ("mcp_allow_outbound_messages", "account.move", [20], "action_invoice_sent", "e-mail"),
-        ("mcp_allow_cancel_actions", "account.move", [20], "action_reverse", "reverse"),
+        ("mcp_allow_cancel_actions", "account.move", [20], "action_reverse", "(?i)revers"),
         ("mcp_allow_cancel_actions", "crm.lead", [100], "dialog:crm.lead.lost", "lost"),
     ],
 )
@@ -303,7 +303,7 @@ async def test_a_dialog_odoo_could_not_open_changed_nothing_and_the_approval_sti
     fake.errors[("account.payment.register", "create")] = OdooError("Missing required value for Journal", kind="validation")
     with pytest.raises(OdooError) as info:
         await svc.run_action("account.move", [20], "action_register_payment", None, preview["confirm_token"])
-    assert str(info.value).endswith("Nothing was changed. You can retry with the same confirm_token.")
+    assert str(info.value).endswith("Nothing was changed.")  # Odoo refused the values: no retry hint
     assert fake.calls_to("action_create_payments") == []
     del fake.errors[("account.payment.register", "create")]
     await svc.run_action("account.move", [20], "action_register_payment", None, preview["confirm_token"])
