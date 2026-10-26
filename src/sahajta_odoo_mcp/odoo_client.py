@@ -40,6 +40,7 @@ _SAFE_TO_RETRY = frozenset(
     {
         "search", "search_read", "search_count", "read", "fields_get", "name_search", "get_views",
         "formatted_read_group", "read_group", "context_get", "default_get", "get_available_models",
+        "has_access", "onchange",  # previews: onchange computes a new record in memory, as Odoo's own forms do
     }
 )
 # Waits before the 2nd and 3rd attempt, each varied by +-30% so that parallel serverless instances

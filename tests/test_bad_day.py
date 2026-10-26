@@ -170,7 +170,10 @@ class VirtualTimeApp:
 # ================================================================================ Odoo having a bad day
 
 READS = frozenset(
-    {"context_get", "read", "search", "search_read", "search_count", "fields_get", "name_search", "get_views", "default_get"}
+    {
+        "context_get", "read", "search", "search_read", "search_count", "fields_get", "name_search", "get_views",
+        "default_get", "has_access", "onchange",
+    }
 )
 CHANGES = frozenset({"create", "write", "action_confirm", "message_post"})
 FAULTS = (

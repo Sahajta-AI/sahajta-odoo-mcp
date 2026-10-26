@@ -447,7 +447,7 @@ async def test_list_actions_in_read_only_mode(fake):
 async def test_action_flow(svc, fake):
     preview = await svc.preview_action("sale.order", [5], "action_confirm", None)
     assert preview["records"][0]["state"] == "draft"
-    assert "button_hidden_when" in preview
+    assert "button_hidden_when" not in preview  # Odoo's raw condition was noise for the person
     assert changes(fake) == []
     result = await svc.run_action("sale.order", [5], "action_confirm", None, preview["confirm_token"])
     assert changes(fake) == ["sale.order.action_confirm"]
@@ -721,8 +721,9 @@ async def test_add_note_respects_model_write_restrictions(fake):
 
 
 async def test_messages_need_the_outbound_flag_and_always_a_token(fake):
-    with pytest.raises(PolicyViolation, match="MCP_ALLOW_OUTBOUND_MESSAGES"):
+    with pytest.raises(PolicyViolation, match="switched off for Claude") as info:
         await make_service(fake).preview_message("crm.lead", 100, "Hello")
+    assert "MCP_" not in str(info.value)  # Claude is told in plain words, not the operator's setting name
 
     svc = make_service(fake, mcp_allow_outbound_messages=True, mcp_require_preview=False)
     fake.followers = [{"partner_id": [2, "Jane Buyer"]}, {"partner_id": [1, "Acme Corp"]}, {"partner_id": False}]
