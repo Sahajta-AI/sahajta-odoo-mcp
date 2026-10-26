@@ -16,7 +16,6 @@ import time
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -26,6 +25,7 @@ import httpx
 from .audit import AuditLog
 from .config import Settings
 from .confirm import ConfirmationSigner
+from .deadline import CALL_STARTED, SEND_BY
 from .errors import NotSent, OdooError, OdooMCPError, PolicyViolation, ValidationFailed
 from .formatting import UNTRUSTED_NOTE, Formatter
 from .odoo_client import OdooClient, OdooIdentity
@@ -86,11 +86,6 @@ _KNOWN_WIZARDS = {
     "convert to opportunity": "crm.lead2opportunity.partner",
     "new quotation": "sale.order",
 }
-
-
-# When the current tool call began (set by tools.run), so the time budget also counts the sign-in
-# lookup a cold server instance does before the service exists.
-CALL_STARTED: ContextVar[float | None] = ContextVar("call_started", default=None)
 
 
 @dataclass
@@ -193,24 +188,33 @@ class OdooService:
         When Odoo provably did not apply it, the approval is handed back so the same confirm_token can be
         retried. When it may have (a timeout or dropped connection after sending), the approval stays used.
         """
-        used = time.monotonic() - attempt.started
-        if used > _SEND_DEADLINE:
-            attempt.outcome = self._hand_back(token)
-            error = NotSent(
-                f"This call had already taken {used:.0f} seconds, so the change was not sent to Odoo "
-                "(it could have been cut off half-way)"
-            )
-            error.outcome = attempt.outcome
-            raise error
+        if time.monotonic() - attempt.started > _SEND_DEADLINE:
+            raise self._not_sent(attempt, token)
+        # The client checks this again once it is this change's turn to go to Odoo (see odoo_client.call).
+        send_by = SEND_BY.set(attempt.started + _SEND_DEADLINE)
         try:
             return await send()
         except OdooError as exc:
+            if exc.kind == "late":
+                raise self._not_sent(attempt, token) from exc
             if exc.maybe_applied:
                 attempt.outcome, attempt.check = unknown, check
             else:
                 attempt.outcome = self._hand_back(token)
             exc.outcome = attempt.outcome  # so the audit entry says it too
             raise
+        finally:
+            SEND_BY.reset(send_by)
+
+    def _not_sent(self, attempt: _Attempt, token: str | None) -> NotSent:
+        used = time.monotonic() - attempt.started
+        attempt.outcome = self._hand_back(token)
+        error = NotSent(
+            f"This call had already taken {used:.0f} seconds, so the change was not sent to Odoo "
+            "(it could have been cut off half-way)"
+        )
+        error.outcome = attempt.outcome
+        return error
 
     def _hand_back(self, token: str | None) -> str:
         """For a change Odoo provably did not apply: makes its approval usable again."""
@@ -956,12 +960,13 @@ class OdooService:
                     self.client.call(model, "read", ids=id_list, fields=["display_name", *scalar], context=self._read_context(True)),
                     attempt,
                 )
-            except Exception as exc:  # the change went through: a failed read must not turn this into an error
+                updated = self.fmt.records(after, fields)
+            except Exception as exc:  # the change went through: a failed or odd read must not turn this into an error
                 logger.warning("read-back after odoo_update failed: %s", type(exc).__name__)
                 message = f"Updated {len(id_list)} {model} record(s). {_READ_BACK_FAILED}"
                 return {"ids": id_list, "model": model, "message": message}
             return {
-                "updated": self.fmt.records(after, fields),
+                "updated": updated,
                 "model": model,
                 "message": f"Updated {len(id_list)} {model} record(s). The values above were read back from Odoo.",
             }

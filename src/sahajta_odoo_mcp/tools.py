@@ -17,12 +17,17 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from .config import Settings
-from .errors import OdooMCPError
-from .service import CALL_STARTED, OdooService
+from .deadline import CALL_STARTED
+from .errors import OdooError, OdooMCPError
+from .service import OdooService
 
 logger = logging.getLogger(__name__)
 
 ServiceGetter = Callable[[], Awaitable[OdooService]]
+KEY_REJECTED = (
+    "Odoo no longer accepts your API key (it may have been revoked or has expired). Reconnect the Odoo connector "
+    "in Claude and sign in with a valid key."
+)
 
 INSTRUCTIONS = """\
 You are connected to the company's Odoo ERP, acting as the signed-in employee with their Odoo permissions.
@@ -91,21 +96,34 @@ Values = Annotated[
 Method = Annotated[str, Field(description="The button's method name from odoo_list_actions, e.g. 'action_confirm'.")]
 
 
-def register_tools(mcp: MCPServer, get_service: ServiceGetter, settings: Settings) -> None:
+def register_tools(
+    mcp: MCPServer, get_service: ServiceGetter, settings: Settings, on_key_rejected: Callable[[], None] | None = None
+) -> None:
+    """on_key_rejected() is called when Odoo answers a tool call with HTTP 401 (the person's key no longer works)."""
+
     async def run(fn: Callable[[OdooService], Awaitable[Any]]) -> str:
         started = CALL_STARTED.set(time.monotonic())
+        service = None
         try:
             service = await get_service()
             result = await fn(service)
         except ToolError:
             raise
+        except OdooError as exc:
+            # Only Odoo's own 401 proves the key is no longer valid; other AccessDenied answers sign nobody out.
+            if exc.kind == "auth" and exc.status == 401 and on_key_rejected is not None:
+                on_key_rejected()
+                raise ToolError(f"{KEY_REJECTED} {exc.outcome}".rstrip()) from exc
+            raise ToolError(str(exc)) from exc
         except OdooMCPError as exc:
             raise ToolError(str(exc)) from exc
         except Exception as exc:  # never leak internals to the model
             ref = secrets.token_hex(4)
             logger.exception("unexpected error (ref %s)", ref)
+            if service is None:  # the tool never ran, so nothing was sent to Odoo
+                raise ToolError(f"Unexpected server error (ref {ref}). Nothing was changed; try again in a moment.") from exc
             raise ToolError(
-                f"Unexpected server error (ref {ref}). If this was a change, it may or may not have been applied: "
+                f"Unexpected server error (ref {ref}). If this was a change, Odoo may already have applied it: "
                 "check the record in Odoo before retrying."
             ) from exc
         finally:

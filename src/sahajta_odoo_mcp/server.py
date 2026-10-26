@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import os
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
 from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
@@ -32,18 +35,29 @@ from .policy import SafetyPolicy
 from .ratelimit import RateLimiter
 from .schema import SchemaCache
 from .service import OdooService, Shared
-from .state import MemoryState, RedisState, redis_client
+from .state import MemoryState, RedisState, SQLiteState, redis_client
 from .usage import UsageLog
 from .tools import INSTRUCTIONS, register_tools
+
+logger = logging.getLogger(__name__)
 
 SERVER_NAME = "sahajta-odoo"
 SERVER_TITLE = "Sahajta Odoo"
 _SERVICE_TTL_SECONDS = 600
+_SIGN_IN_UNAVAILABLE = "Couldn't load your sign-in just now. Nothing was changed; try again in a moment."
 
 
-def build_shared(settings: Settings, secret: bytes, http: httpx.AsyncClient | None = None) -> Shared:
+def build_shared(
+    settings: Settings, secret: bytes, http: httpx.AsyncClient | None = None, *, claims_file: Path | None = None
+) -> Shared:
+    """claims_file: where single-use markers are kept when there is no Redis (else they live in memory)."""
     redis_conn = redis_client(settings.mcp_redis_url.get_secret_value()) if settings.mcp_redis_url else None
-    state = RedisState(redis_conn) if redis_conn is not None else MemoryState()
+    if redis_conn is not None:
+        state = RedisState(redis_conn)
+    elif claims_file is not None:
+        state = SQLiteState(claims_file)
+    else:
+        state = MemoryState()
     usage = UsageLog(redis_conn) if redis_conn is not None else None
     return Shared(
         settings=settings,
@@ -89,9 +103,14 @@ def create_stdio_server(settings: Settings, http: httpx.AsyncClient | None = Non
 
     async def get_service() -> OdooService:
         if "service" not in holder:
-            identity = await client.identity()
+            try:
+                identity = await client.identity()
+            except OdooError as exc:
+                raise ToolError(f"{exc}. Nothing was changed.") from exc
             if not identity.is_internal_user:
-                raise ToolError("This Odoo account is a portal/customer account; use an internal employee account.")
+                raise ToolError(
+                    "This Odoo account is a portal/customer account; use an internal employee account. Nothing was changed."
+                )
             holder["service"] = OdooService(shared, client, identity)
         return holder["service"]
 
@@ -105,7 +124,10 @@ def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
     from .oauth import build_oauth  # imported lazily: stdio mode does not need it
 
     settings.require_http_settings()
-    shared = build_shared(settings, settings.mcp_secret.get_secret_value().encode(), http)
+    shared = build_shared(
+        settings, settings.mcp_secret.get_secret_value().encode(), http,
+        claims_file=Path(settings.mcp_data_dir) / "claims.sqlite3",
+    )
 
     def record_signout(login: str, reason: str) -> None:
         # Every ended sign-in lands in the usage log, so the owners can be alerted.
@@ -114,11 +136,29 @@ def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
     oauth = build_oauth(settings, shared.http, on_revoke=record_signout)
     services: OrderedDict[str, tuple[float, OdooService]] = OrderedDict()
 
+    def service_key(token: AccessToken) -> str:
+        return str((token.claims or {}).get("grant_id") or token.token)
+
+    def end_sign_in(token: AccessToken) -> None:
+        """Odoo itself rejected the key (revoked or expired): end this sign-in so Claude asks the person to reconnect."""
+        services.pop(service_key(token), None)
+        try:
+            oauth.revoke(token, "Odoo rejected the API key")
+        except Exception as exc:  # the sign-in store did not answer; the person is told to reconnect all the same
+            logger.warning("could not end a sign-in after Odoo rejected its key: %s", type(exc).__name__)
+
+    def key_rejected() -> None:
+        """Odoo answered a tool call with 401: the key stopped working after this service was built."""
+        token = get_access_token()
+        if token is not None:
+            end_sign_in(token)
+
     async def get_service() -> OdooService:
+        # Every error here comes before anything is sent to Odoo, so each one says nothing was changed.
         token = get_access_token()
         if token is None:
-            raise ToolError("Not signed in. Reconnect the Odoo connector in Claude.")
-        key = str((token.claims or {}).get("grant_id") or token.token)
+            raise ToolError("Not signed in. Nothing was changed. Reconnect the Odoo connector in Claude.")
+        key = service_key(token)
         now = time.monotonic()
         hit = services.get(key)
         if hit and hit[0] > now:
@@ -130,7 +170,12 @@ def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
             # Our own record says no (e.g. the token expired since the check a moment ago). Odoo was not asked,
             # so this says nothing about the API key: revoke nothing.
             shared.audit.record(user=login, uid=None, tool="connect", outcome="error", detail=f"{exc.kind}: {exc}")
-            raise ToolError(f"{exc}. Try again; if this keeps happening, reconnect the Odoo connector in Claude.") from exc
+            raise ToolError(
+                f"{exc}. Nothing was changed. Try again; if this keeps happening, reconnect the Odoo connector in Claude."
+            ) from exc
+        except Exception as exc:  # the sign-in store (Redis or SQLite) did not answer: says nothing about the key
+            logger.warning("could not load a sign-in: %s", type(exc).__name__)
+            raise ToolError(_SIGN_IN_UNAVAILABLE) from exc
         client = OdooClient(
             creds, shared.http, protocol=settings.odoo_protocol, timeout=settings.odoo_timeout_seconds,
             max_parallel=settings.odoo_max_parallel_requests, cache=shared.state,
@@ -140,12 +185,11 @@ def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
         except OdooError as exc:
             shared.audit.record(user=login, uid=None, tool="connect", outcome="error", detail=f"{exc.kind}: {exc}")
             if exc.kind == "auth":
-                # Odoo itself rejected the key (revoked or expired): end this sign-in so Claude asks the person to reconnect.
-                oauth.revoke(token, "Odoo rejected the API key")
-                raise ToolError(f"{exc}. Reconnect the Odoo connector in Claude.") from exc
+                end_sign_in(token)
+                raise ToolError(f"{exc}. Nothing was changed. Reconnect the Odoo connector in Claude.") from exc
             raise ToolError(f"{exc}. Nothing was changed; try again in a moment.") from exc
         if not identity.is_internal_user:
-            raise ToolError("This Odoo account is a portal/customer account and cannot use this connector.")
+            raise ToolError("This Odoo account is a portal/customer account and cannot use this connector. Nothing was changed.")
         service = OdooService(shared, client, identity)
         services[key] = (now + _SERVICE_TTL_SECONDS, service)
         while len(services) > 500:
@@ -153,7 +197,7 @@ def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
         return service
 
     mcp = _new_server(token_verifier=oauth.token_verifier, auth=oauth.auth_settings)
-    register_tools(mcp, get_service, settings)
+    register_tools(mcp, get_service, settings, on_key_rejected=key_rejected)
     for route in oauth.routes:
         mcp.custom_route(route.path, methods=sorted(route.methods or ["GET"]), name=route.name)(route.endpoint)
 
@@ -201,6 +245,8 @@ def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
             finally:
                 await oauth.aclose()
                 await shared.http.aclose()
+                if isinstance(shared.state, SQLiteState):
+                    shared.state.close()
 
     app.router.lifespan_context = lifespan
     return _NoListenStream(app)

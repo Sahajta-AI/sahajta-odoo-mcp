@@ -24,8 +24,7 @@ Invariants (checked by `Watch`, `says` and `check_round`):
      change is never sent late in a call, and a sent change is answered within Vercel's 60 s.
   6. No answer contains the API key, a token, or a setting name meant for operators.
 
-Tests marked xfail(strict=True) document real bugs in src/ (see each reason). Fixing a bug makes its
-test pass, which fails the suite until the xfail mark is removed.
+Section 7 holds the bugs this suite found in src/, now fixed; each test says what it guards.
 """
 
 from __future__ import annotations
@@ -51,6 +50,7 @@ from starlette.testclient import TestClient
 
 import sahajta_odoo_mcp.oauth as oauth_package
 from conftest import FakeOdoo as Records
+from sahajta_odoo_mcp import deadline as deadline_module
 from sahajta_odoo_mcp import odoo_client
 from sahajta_odoo_mcp import server as server_module
 from sahajta_odoo_mcp import service as service_module
@@ -65,7 +65,7 @@ BACKENDS = ["sqlite", "redis"]
 
 
 def expect(condition: object, what: str) -> None:
-    """A precondition of the scenario itself. RuntimeError, so a broken setup never passes as an xfail."""
+    """A precondition of the scenario itself. RuntimeError, so a broken setup is never mistaken for a broken invariant."""
     if not condition:
         raise RuntimeError(f"scenario setup failed: {what}")
 
@@ -96,7 +96,7 @@ def timeline() -> Timeline:
     return _NOW.get() or _OUTSIDE
 
 
-VIRTUAL_TIME = SimpleNamespace(monotonic=lambda: 10_000.0 + timeline().t)  # `time` as service.py and tools.py see it
+VIRTUAL_TIME = SimpleNamespace(monotonic=lambda: 10_000.0 + timeline().t)  # `time` as service.py, tools.py, deadline.py see it
 
 
 async def _virtual_sleep(seconds: float, result=None):
@@ -497,6 +497,7 @@ def make_deployment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(service_module, "asyncio", _VirtualAsyncio())
     monkeypatch.setattr(service_module, "time", VIRTUAL_TIME)
     monkeypatch.setattr(tools_module, "time", VIRTUAL_TIME)
+    monkeypatch.setattr(deadline_module, "time", VIRTUAL_TIME)  # the call's time budget, as odoo_client.py sees it
     built: list[Deployment] = []
     routers: list[respx.MockRouter] = []
 
@@ -729,8 +730,7 @@ def test_a_bad_day(make_deployment, backend, seed):
         elif step == "change":
             run_change(env, watch, rng, tokens["access_token"], rng.choice(CHANGE_KINDS), n)
         elif step == "cold":
-            # Vercel adds a cold instance next to the warm ones; the single container restarts (only between
-            # changes: used approvals do not survive a restart, see the last xfail test).
+            # Vercel adds a cold instance next to the warm ones; the single container restarts.
             env.start_instance() if backend == "redis" else env.restart()
         else:
             env.auth_sky.p = 0
@@ -1025,16 +1025,14 @@ def test_a_change_is_not_sent_late_and_its_approval_works_afterwards(make_deploy
     assert check_round(env, approval, 0, [watch.check(env.call(access, tool, **args))]) == ["done"]
 
 
-# ================================================================================ 7. known bugs (strict xfail)
+
+# ================================================================================ 7. bugs found by this suite, now fixed
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "BUG: a revoked key ends the sign-in only when a cold instance re-checks the identity. While the service "
-    "is cached (server.py:123-125, 10 min) or the identity is cached in Redis (odoo_client.py:181-196, 10 min), "
-    "Odoo's 401 on a data call is a plain error: no sign-out and no 'Reconnect', for up to 10 minutes."
-))
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_bug_a_revoked_key_on_a_warm_instance_ends_the_sign_in(make_deployment, backend):
+def test_a_revoked_key_on_a_warm_instance_ends_the_sign_in(make_deployment, backend):
+    """The service (10 min) and, on Vercel, the identity in Redis (10 min) skip Odoo's key check; a 401 on a data
+    call must still end the sign-in, not give a plain error until the caches expire."""
     env = make_deployment(backend)
     _, tokens = env.sign_in()
     expect(not env.call(tokens["access_token"], "odoo_whoami").is_error, "first call")  # caches service and identity
@@ -1044,14 +1042,39 @@ def test_bug_a_revoked_key_on_a_warm_instance_ends_the_sign_in(make_deployment, 
     answer = env.call(tokens["access_token"], "odoo_read", **READ_LEAD)
     assert "Reconnect the Odoo connector" in answer.text, answer.text
     assert [s["detail"] for s in env.signouts()] == ["Odoo rejected the API key"]
+    assert env.call(tokens["access_token"], "odoo_whoami").status == 401  # Claude now asks the person to sign in
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "BUG: errors raised while the service is built (server.py:133, 145, 148) skip the change tools' outcome "
-    "wording: a change tool refused for a revoked key says 'Reconnect the Odoo connector' but neither "
-    "'Nothing was changed' nor 'may already have'."
-))
-def test_bug_a_change_refused_for_a_revoked_key_says_nothing_was_changed(make_deployment):
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_a_change_refused_by_a_401_on_a_warm_instance_says_nothing_was_changed(make_deployment, backend):
+    env = make_deployment(backend)
+    watch = Watch(env)
+    _, tokens = env.sign_in()
+    access = tokens["access_token"]
+    approval, tool, args = approve(env, watch, access, "update", 1)
+    env.odoo.revoked_keys.add(PRIYA_KEY)
+    answer = env.call(access, tool, **args)
+    assert "Reconnect the Odoo connector" in answer.text and says(answer) == "nothing", answer.text
+    assert env.odoo.applied_for(approval) == [] and len(env.signouts()) == 1
+
+
+def test_an_access_denied_without_a_401_signs_nobody_out(make_deployment):
+    env = make_deployment("sqlite")
+    _, tokens = env.sign_in()
+    expect(not env.call(tokens["access_token"], "odoo_whoami").is_error, "first call")
+
+    async def denied(request, model, method):
+        body = {"name": "odoo.exceptions.AccessDenied", "message": "Access Denied"}
+        return httpx.Response(403, json=body) if model == "crm.lead" else None
+
+    env.odoo.on_request = denied
+    answer = env.call(tokens["access_token"], "odoo_read", **READ_LEAD)
+    assert answer.is_error and "reconnect" not in answer.text.lower(), answer.text
+    assert env.still_signed_in(), env.signouts()
+
+
+def test_a_change_refused_for_a_revoked_key_says_nothing_was_changed(make_deployment):
+    """Errors raised while the service is built come before anything is sent: they say so."""
     env = make_deployment("sqlite")
     _, tokens = env.sign_in()
     env.odoo.revoked_keys.add(PRIYA_KEY)
@@ -1061,12 +1084,8 @@ def test_bug_a_change_refused_for_a_revoked_key_says_nothing_was_changed(make_de
     assert says(answer) == "nothing"
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "BUG: a Redis error while the sign-in is loaded for a cold instance (server.py:127-133 catches only "
-    "OdooError) becomes 'Unexpected server error ... it may or may not have been applied' (tools.py:104-110) "
-    "for a change that was never sent: neither 'Nothing was changed' nor 'may already have'."
-))
-def test_bug_a_redis_blip_while_loading_the_sign_in_says_nothing_was_changed(make_deployment):
+def test_a_redis_blip_while_loading_the_sign_in_says_nothing_was_changed(make_deployment):
+    """A storage error while a cold instance loads the sign-in is no 'unexpected server error' and no sign-out."""
     env = make_deployment("redis")
     _, tokens = env.sign_in()
     env.restart()  # cold: the service is built, which reads the sign-in again after the token check
@@ -1081,14 +1100,12 @@ def test_bug_a_redis_blip_while_loading_the_sign_in_says_nothing_was_changed(mak
     answer = env.call(tokens["access_token"], tool, **args)
     expect(answer.is_error and env.odoo.applied == [], "refused before Odoo")
     assert says(answer) == "nothing", answer.text
+    assert "Couldn't load your sign-in" in answer.text and env.still_signed_in()
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "BUG: a 200 answer to res.users/context_get without a uid (e.g. a proxy's JSON error page) is read as "
-    "'the key is invalid' (odoo_client.py:200-204, kind='auth') and server.py:142-145 signs the person out."
-))
 @pytest.mark.parametrize("body", ['{"error": "upstream timed out"}', "{}"])
-def test_bug_an_odd_200_from_odoo_never_signs_the_person_out(make_deployment, body):
+def test_an_odd_200_from_odoo_never_signs_the_person_out(make_deployment, body):
+    """A 200 from res.users/context_get without a uid (e.g. a proxy's JSON error page) says nothing about the key."""
     env = make_deployment("sqlite")
     _, tokens = env.sign_in()
     env.restart()
@@ -1101,12 +1118,7 @@ def test_bug_an_odd_200_from_odoo_never_signs_the_person_out(make_deployment, bo
     assert env.still_signed_in(), env.signouts()
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "BUG: odoo_update formats its read-back outside the try (service.py:963-964). When Odoo applied the change "
-    "but the read-back is JSON of the wrong shape, the person gets 'Unexpected server error ... may or may not "
-    "have been applied' for a change that went through."
-))
-def test_bug_an_applied_update_with_an_odd_read_back_is_reported_done(make_deployment):
+def test_an_applied_update_with_an_odd_read_back_is_reported_done(make_deployment):
     env = make_deployment("sqlite")
     watch = Watch(env)
     _, tokens = env.sign_in()
@@ -1122,16 +1134,19 @@ def test_bug_an_applied_update_with_an_odd_read_back_is_reported_done(make_deplo
     answer = env.call(tokens["access_token"], tool, **args)
     expect(len(env.odoo.applied_for(approval)) == 1, "Odoo applied the change")
     assert says(answer) == "done", answer.text
+    assert READ_BACK_FAILED in answer.text
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "BUG: read tools have no call-wide time budget. Each Odoo request may wait up to 15 s for retries "
-    "(odoo_client.py:160-172 with _retry_wait, 464-474) and the waits add up: a cold odoo_read under steady "
-    "throttling (two 429s with Retry-After: 6 per request) takes ~69 s, past Vercel's 60 s limit."
-))
-def test_bug_a_read_under_throttling_ends_within_the_time_limit(make_deployment):
+def test_a_read_under_throttling_ends_within_the_time_limit(make_deployment):
+    """Each request's retry waits are capped, but they add up across requests: a cold odoo_read under steady
+    throttling took 69 s. The call now stops retrying before the soft limit and says Odoo is busy.
+
+    (A cold read makes 5 Odoo requests here, each turned away twice with Retry-After: 6. That is 60 s of waiting
+    at least, so no answer can arrive in time: a clear error is the right outcome.)"""
     env = make_deployment("sqlite")
+    watch = Watch(env)
     _, tokens = env.sign_in()
+    watch.tokens(tokens)
     env.restart()
     tries = Counter()
 
@@ -1142,22 +1157,22 @@ def test_bug_a_read_under_throttling_ends_within_the_time_limit(make_deployment)
         return None
 
     env.odoo.on_request = throttled
-    answer = env.call(tokens["access_token"], "odoo_read", **READ_LEAD)
-    expect(not answer.is_error, "the read got through in the end")
+    answer = watch.check(env.call(tokens["access_token"], "odoo_read", **READ_LEAD))  # the record, or a clear error
     assert answer.seconds <= 60, f"{answer.seconds:.0f} virtual seconds"
+    assert not answer.is_error or "rate limiting" in answer.text, answer.text
+    env.odoo.on_request = None
+    assert not watch.check(env.call(tokens["access_token"], "odoo_read", **READ_LEAD)).is_error
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "BUG: the 20 s send deadline is checked before the change waits for the per-Odoo gate (service.py:196-206, "
-    "then odoo_client.py:163). With parallel calls on one instance, a change checked 1 s into its call was sent "
-    "26 s into it, where Vercel can cut it off half-way."
-))
-def test_bug_a_change_queued_behind_a_slow_call_is_not_sent_late(make_deployment):
+def test_a_change_queued_behind_a_slow_call_is_not_sent_late(make_deployment):
+    """The 20 s send deadline is checked again once the change gets its turn at the per-Odoo gate: a change checked
+    1 s into its call used to be sent 26 s into it, where Vercel can cut it off half-way."""
     env = make_deployment("sqlite", shared_clock=True)
     watch = Watch(env)
     _, tokens = env.sign_in()
     access = tokens["access_token"]
     approval, tool, args = approve(env, watch, access, "update", 1)
+    env.odoo.approval = approval
     env.call(access, "odoo_search", model="crm.lead")  # warm caches
     search_now, seen = asyncio.Event(), Counter()
 
@@ -1186,18 +1201,21 @@ def test_bug_a_change_queued_behind_a_slow_call_is_not_sent_late(make_deployment
 
         return await asyncio.gather(env.post_tool(http, access, tool, args), search_later())
 
-    env.run_async(update_then_search)
+    update, _ = env.run_async(update_then_search)
     expect(seen["queued"] and seen["slow"], "the search queued behind the update and was slow")
-    [sent_at] = env.odoo.change_sent_at
-    assert sent_at - started <= 20, f"sent {sent_at - started:.0f} s into the call"
+    late = [sent_at - started for sent_at in env.odoo.change_sent_at if sent_at - started > 20]
+    assert late == [], f"sent {late[0]:.0f} s into the call"
+    answer = watch.check(ToolResult.of(tool, args, update))
+    assert says(answer) == "nothing" and "not sent to Odoo" in answer.text, answer.text
+    assert answer.text.endswith("You can retry with the same confirm_token.")
+    env.odoo.on_request = None
+    assert says(watch.check(env.call(access, tool, **args))) == "done"
+    assert len(env.odoo.applied_for(approval)) == 1
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "BUG (ODOO_PROTOCOL=auto without ODOO_DB): a non-JSON 200 page on the JSON-2 check (e.g. a maintenance page) "
-    "is taken as 'no JSON-2' (odoo_client.py:279-285) and the person is told 'ODOO_DB must be set to use the "
-    "legacy JSON-RPC protocol' (odoo_client.py:289-291): an operator setting name, and no way for them to act on it."
-))
-def test_bug_a_maintenance_page_does_not_show_operator_settings(make_deployment):
+def test_a_maintenance_page_does_not_show_operator_settings(make_deployment):
+    """ODOO_PROTOCOL=auto without ODOO_DB: a non-JSON 200 page on the JSON-2 check (e.g. a maintenance page) is not
+    taken as 'no JSON-2', since the JSON-RPC fallback cannot work without a database name."""
     env = make_deployment("sqlite", odoo_protocol="auto", odoo_db=None)
     _, tokens = env.sign_in()
     env.restart()
@@ -1205,13 +1223,13 @@ def test_bug_a_maintenance_page_does_not_show_operator_settings(make_deployment)
     answer = env.call(tokens["access_token"], "odoo_whoami")
     expect(answer.is_error and env.still_signed_in(), "a plain error, no sign-out")
     assert "ODOO_DB" not in answer.text, answer.text
+    assert env.odoo.legacy.call_count == 0
+    env.odoo.calm()
+    assert not env.call(tokens["access_token"], "odoo_whoami").is_error
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "BUG (single-container deployment): used approvals live in memory (state.py MemoryState via server.py:46). "
-    "After a restart, a confirm_token whose create timed out is accepted again and the record is created twice."
-))
-def test_bug_an_approval_with_an_unknown_outcome_is_not_reused_after_a_restart(make_deployment):
+def test_an_approval_with_an_unknown_outcome_is_not_reused_after_a_restart(make_deployment):
+    """Single container: used approvals are kept in SQLite in the data directory, not only in memory."""
     env = make_deployment("sqlite")
     watch = Watch(env)
     _, tokens = env.sign_in()
@@ -1222,6 +1240,21 @@ def test_bug_an_approval_with_an_unknown_outcome_is_not_reused_after_a_restart(m
     expect(says(env.call(access, tool, **args)) == "maybe", "the create timed out after Odoo carried it out")
     env.odoo.calm()
     env.restart()
-    env.call(access, tool, **args)  # Claude retries the same approval
+    retry = env.call(access, tool, **args)  # Claude retries the same approval
     assert len(env.odoo.applied_for(approval)) == 1
+    assert says(retry) == "nothing" and "already used" in retry.text, retry.text
 
+
+def test_an_approval_handed_back_before_a_restart_works_after_it(make_deployment):
+    env = make_deployment("sqlite")
+    watch = Watch(env)
+    _, tokens = env.sign_in()
+    access = tokens["access_token"]
+    approval, tool, args = approve(env, watch, access, "create", 1)
+    env.odoo.approval = approval
+    env.odoo.storm(1.0, ("connect",), methods={"create"})
+    expect(says(env.call(access, tool, **args)) == "nothing", "the create never reached Odoo")
+    env.odoo.calm()
+    env.restart()
+    assert says(watch.check(env.call(access, tool, **args))) == "done"
+    assert len(env.odoo.applied_for(approval)) == 1

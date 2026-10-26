@@ -6,13 +6,14 @@ import asyncio
 import email.utils
 import json
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import httpx
 import pytest
 import respx
 
-from sahajta_odoo_mcp import odoo_client
+from sahajta_odoo_mcp import deadline, odoo_client
 from sahajta_odoo_mcp.errors import OdooError
 from sahajta_odoo_mcp.odoo_client import OdooClient, OdooCredentials, new_http_client
 
@@ -337,13 +338,25 @@ async def test_auto_does_not_fall_back_on_auth_errors(router):
     assert info.value.kind == "auth" and jsonrpc.call_count == 0
 
 
-async def test_jsonrpc_needs_a_database(router):
-    router.post("/json/2/res.users/context_get").mock(return_value=httpx.Response(404))
+@pytest.mark.parametrize("answer", [httpx.Response(404), httpx.Response(200, text="<html>Down for maintenance</html>")])
+async def test_auto_without_a_database_never_falls_back(router, answer):
+    # JSON-RPC needs a database name, so without one the probe's own error is the answer
+    router.post("/json/2/res.users/context_get").mock(return_value=answer)
+    jsonrpc = router.post("/jsonrpc")
     async with httpx.AsyncClient() as http:
-        with pytest.raises(OdooError, match="ODOO_DB") as info:
+        with pytest.raises(OdooError) as info:
             await make_client(http, protocol="auto", db=None).call("res.partner", "read", ids=[1])
+    assert info.value.status == answer.status_code and jsonrpc.call_count == 0
+    assert info.value.kind != "auth"  # not a bad key: must never end the person's sign-in
+    assert "ODOO_DB" not in str(info.value)  # operator settings are for the log, not the person
+
+
+async def test_jsonrpc_needs_a_database(router):
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(OdooError) as info:
+            await make_client(http, protocol="jsonrpc", db=None).call("res.partner", "read", ids=[1])
     # a server setting, not a bad key: must never end the person's sign-in
-    assert info.value.kind == "config"
+    assert info.value.kind == "config" and "ODOO_DB" not in str(info.value)
 
 
 async def test_auto_probe_retries_when_odoo_is_busy(router, sleeps):
@@ -552,6 +565,59 @@ async def test_total_retry_waiting_stays_under_fifteen_seconds(router, sleeps):
         with pytest.raises(OdooError):
             await make_client(http).call("res.partner", "read", ids=[1])
     assert route.call_count == 2 and sleeps == [8.0]  # a second 8 s wait would pass 15 s
+
+
+@contextmanager
+def call_started(seconds_ago: float | None):
+    """Inside a tool call that started `seconds_ago` (as tools.run marks it); None: outside any tool call."""
+    if seconds_ago is None:
+        yield
+        return
+    token = deadline.CALL_STARTED.set(time.monotonic() - seconds_ago)
+    try:
+        yield
+    finally:
+        deadline.CALL_STARTED.reset(token)
+
+
+async def test_no_retry_wait_runs_past_the_calls_soft_limit(router, sleeps):
+    route = router.post("/json/2/res.partner/read").mock(
+        return_value=httpx.Response(429, json={}, headers={"Retry-After": "6"})
+    )
+    async with httpx.AsyncClient() as http:
+        with call_started(deadline.SOFT_LIMIT - 5), pytest.raises(OdooError) as info:  # a 6 s wait would end too late
+            await make_client(http).call("res.partner", "read", ids=[1])
+    assert info.value.kind == "rate_limited" and route.call_count == 1 and sleeps == []
+
+
+async def test_the_json2_probe_waits_only_within_the_calls_soft_limit(router, sleeps):
+    route = router.post("/json/2/res.users/context_get").mock(return_value=httpx.Response(503, json={}))
+    async with httpx.AsyncClient() as http:
+        with call_started(deadline.SOFT_LIMIT - 1), pytest.raises(OdooError) as info:
+            await make_client(http, protocol="auto").call("res.partner", "read", ids=[1])
+    assert info.value.kind == "unavailable" and route.call_count == 1 and sleeps == []
+
+
+@pytest.mark.parametrize("seconds_ago, expected", [(None, 30.0), (10, 30.0), (30, 20.0), (48, 5.0), (70, 5.0)])
+async def test_each_request_ends_before_the_calls_soft_limit(router, seconds_ago, expected):
+    route = router.post("/json/2/res.partner/read").mock(return_value=httpx.Response(200, json=[]))
+    async with httpx.AsyncClient() as http:
+        with call_started(seconds_ago):
+            await make_client(http, timeout=30.0).call("res.partner", "read", ids=[1])
+    timeout = route.calls[0].request.extensions["timeout"]
+    assert timeout["read"] == pytest.approx(expected, abs=0.5)
+
+
+async def test_a_change_past_its_send_by_time_is_not_sent(router):
+    route = router.post("/json/2/res.partner/write").mock(return_value=httpx.Response(200, json=True))
+    token = deadline.SEND_BY.set(time.monotonic() - 1)
+    try:
+        async with httpx.AsyncClient() as http:
+            with pytest.raises(OdooError) as info:
+                await make_client(http).call("res.partner", "write", ids=[1], vals={"name": "x"})
+    finally:
+        deadline.SEND_BY.reset(token)
+    assert info.value.kind == "late" and info.value.maybe_applied is False and route.call_count == 0
 
 
 async def test_jsonrpc_busy_answers_carry_retry_after(router, sleeps):
@@ -852,20 +918,21 @@ async def test_portal_users_are_marked_as_not_internal(router):
     assert identity.is_internal_user is False and identity.company_id is None
 
 
-async def test_identity_without_uid_is_an_auth_error(router):
+async def test_identity_without_uid_is_not_an_auth_error(router):
+    # Odoo accepted the key (HTTP 200); an odd answer (e.g. a proxy's error page) says nothing about it
     mock_identity(router, ctx={"tz": "UTC"})
     async with httpx.AsyncClient() as http:
         with pytest.raises(OdooError) as info:
             await make_client(http).identity()
-    assert info.value.kind == "auth"
+    assert info.value.kind == "server"
 
 
-async def test_identity_with_unknown_user_is_an_auth_error(router):
+async def test_identity_with_unknown_user_is_not_an_auth_error(router):
     mock_identity(router, user=[])
     async with httpx.AsyncClient() as http:
         with pytest.raises(OdooError) as info:
             await make_client(http).identity()
-    assert info.value.kind == "auth"
+    assert info.value.kind == "server"
 
 
 async def test_identity_defaults_when_context_lacks_tz_and_lang(router):
