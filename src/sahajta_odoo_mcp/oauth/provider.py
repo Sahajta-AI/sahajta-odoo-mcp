@@ -370,7 +370,7 @@ class OdooAuthProvider(OAuthAuthorizationServerProvider[StoredAuthCode, StoredRe
         try:
             identity = await self.verify_odoo_identity(grant.login, api_key)
         except OdooError as exc:
-            if exc.kind == "auth":
+            if exc.key_rejected:
                 await self._revoke(grant.grant_id, "Odoo rejected the API key")
                 raise TokenError("invalid_grant", "Odoo no longer accepts this API key; sign in again") from None
             logger.warning("Could not re-check grant %s with Odoo during refresh (%s)", grant.grant_id, exc.kind)

@@ -112,3 +112,30 @@ def test_signing_out_from_claude_is_logged(tmp_path: Path):
         assert env.client.post("/revoke", data={"token": tokens["access_token"], "client_id": client_id}).status_code == 200
     [signout] = audit_events(tmp_path, "signout")
     assert signout["user"] == "priya@sahajta.ai" and signout["detail"] == "revoked by the client"
+
+
+ACCESS_DENIED = httpx.Response(400, json={"name": "odoo.exceptions.AccessDenied", "message": "Access Denied"})
+
+
+def test_an_access_denied_that_is_not_a_401_does_not_end_the_sign_in(tmp_path: Path):
+    """Only Odoo refusing the key itself (HTTP 401) may end a sign-in, also while a cold instance starts."""
+    with running_app(tmp_path) as env:
+        _, tokens = connect(env)
+        env.odoo.context_get.side_effect = None
+        env.odoo.context_get.return_value = ACCESS_DENIED
+        result = call_tool(env.client, tokens["access_token"]).json()["result"]
+        assert result["isError"] is True and "Reconnect" not in result["content"][0]["text"]
+        assert "Nothing was changed" in result["content"][0]["text"]
+        assert call_tool(env.client, tokens["access_token"]).status_code == 200  # still signed in
+    assert audit_events(tmp_path, "signout") == []
+
+
+def test_an_access_denied_during_refresh_is_temporary(tmp_path: Path):
+    with running_app(tmp_path) as env:
+        client_id, tokens = connect(env)
+        env.odoo.context_get.side_effect = None
+        env.odoo.context_get.return_value = ACCESS_DENIED
+        data = {"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"], "client_id": client_id}
+        assert env.client.post("/token", data=data).status_code == 503
+        assert call_tool(env.client, tokens["access_token"]).status_code == 200  # still signed in
+    assert audit_events(tmp_path, "signout") == []

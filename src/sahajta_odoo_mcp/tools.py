@@ -110,8 +110,8 @@ def register_tools(
         except ToolError:
             raise
         except OdooError as exc:
-            # Only Odoo's own 401 proves the key is no longer valid; other AccessDenied answers sign nobody out.
-            if exc.kind == "auth" and exc.status == 401 and on_key_rejected is not None:
+            # Only Odoo refusing the key itself ends a sign-in; other AccessDenied answers sign nobody out.
+            if exc.key_rejected and on_key_rejected is not None:
                 on_key_rejected()
                 raise ToolError(f"{KEY_REJECTED} {exc.outcome}".rstrip()) from exc
             raise ToolError(str(exc)) from exc

@@ -184,7 +184,7 @@ def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
             identity = await client.identity()
         except OdooError as exc:
             shared.audit.record(user=login, uid=None, tool="connect", outcome="error", detail=f"{exc.kind}: {exc}")
-            if exc.kind == "auth":
+            if exc.key_rejected:
                 end_sign_in(token)
                 raise ToolError(f"{exc}. Nothing was changed. Reconnect the Odoo connector in Claude.") from exc
             raise ToolError(f"{exc}. Nothing was changed; try again in a moment.") from exc

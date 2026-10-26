@@ -82,6 +82,14 @@ class OdooError(OdooMCPError):
         super().__init__(message)
 
     @property
+    def key_rejected(self) -> bool:
+        """Odoo itself refused the API key: HTTP 401 on JSON-2, or a failed JSON-RPC login (no status).
+
+        The only Odoo answer that may end a person's sign-in; an AccessDenied for one operation must not.
+        """
+        return self.kind == "auth" and self.status in (401, None)
+
+    @property
     def maybe_applied(self) -> bool:
         """False only when this failure proves Odoo did not carry the request out.
 
