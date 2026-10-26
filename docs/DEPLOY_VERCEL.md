@@ -18,7 +18,7 @@ so Redis is required; the app refuses to start without it.
 | Variable | Value |
 |---|---|
 | `ODOO_URL` | `https://sahajta.odoo.com` |
-| `ODOO_PROTOCOL` | `auto` |
+| `ODOO_PROTOCOL` | `json2` (Odoo 19+). Do not use `auto` here: each new function instance would test the connection again. `ODOO_DB` is not needed |
 | `MCP_PUBLIC_URL` | the production URL, e.g. `https://sahajta-odoo-mcp.vercel.app` (no trailing slash) |
 | `MCP_SECRET` | random 48+ characters (sensitive). Changing it signs everyone out |
 | `MCP_ALLOWED_LOGINS` | `person@example.com`: the only Odoo login that may connect |

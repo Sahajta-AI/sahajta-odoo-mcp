@@ -322,8 +322,55 @@ async def test_auto_does_not_fall_back_on_auth_errors(router):
 async def test_jsonrpc_needs_a_database(router):
     router.post("/json/2/res.users/context_get").mock(return_value=httpx.Response(404))
     async with httpx.AsyncClient() as http:
-        with pytest.raises(OdooError, match="ODOO_DB"):
+        with pytest.raises(OdooError, match="ODOO_DB") as info:
             await make_client(http, protocol="auto", db=None).call("res.partner", "read", ids=[1])
+    # a server setting, not a bad key: must never end the person's sign-in
+    assert info.value.kind == "config"
+
+
+async def test_auto_probe_retries_once_when_odoo_is_busy(router, sleeps):
+    # Odoo.com answers 429 when several requests arrive at once; that is not "no JSON-2 here"
+    probe = router.post("/json/2/res.users/context_get").mock(
+        side_effect=[httpx.Response(429, text="<html>Too Many Requests</html>"), httpx.Response(200, json={"uid": 7})]
+    )
+    read = router.post("/json/2/res.partner/read").mock(return_value=httpx.Response(200, json=[]))
+    jsonrpc = router.post("/jsonrpc")
+    async with httpx.AsyncClient() as http:
+        client = make_client(http, protocol="auto", db=None)
+        await client.call("res.partner", "read", ids=[1])
+    assert client.protocol == "json2" and sleeps == [2.0]
+    assert probe.call_count == 2 and read.call_count == 1 and jsonrpc.call_count == 0
+
+
+@pytest.mark.parametrize(
+    "failure, kind",
+    [
+        (httpx.Response(429, text="<html>Too Many Requests</html>"), "rate_limited"),
+        (httpx.Response(503, text="<html>Service Unavailable</html>"), "unavailable"),
+        (httpx.Response(500, text="<html>Internal Server Error</html>"), "server"),
+        (httpx.ReadTimeout("slow"), "timeout"),
+        (httpx.ConnectError("refused"), "network"),
+    ],
+)
+async def test_auto_never_falls_back_to_jsonrpc_on_temporary_failures(router, sleeps, failure, kind):
+    kwargs = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+    router.post("/json/2/res.users/context_get").mock(**kwargs)
+    jsonrpc = router.post("/jsonrpc")
+    async with httpx.AsyncClient() as http:
+        client = make_client(http, protocol="auto", db=None)
+        with pytest.raises(OdooError) as info:
+            await client.call("res.partner", "read", ids=[1])
+    assert info.value.kind == kind  # the real reason, never "auth"
+    assert client.protocol == "auto" and jsonrpc.call_count == 0
+
+
+async def test_auto_falls_back_when_json2_answers_with_a_web_page(router):
+    router.post("/json/2/res.users/context_get").mock(return_value=httpx.Response(200, text="<html>Odoo</html>"))
+    router.post("/jsonrpc").mock(side_effect=JsonRpcServer())
+    async with httpx.AsyncClient() as http:
+        client = make_client(http, protocol="auto")
+        await client.call("res.partner", "search_count", domain=[])
+    assert client.protocol == "jsonrpc"
 
 
 async def test_jsonrpc_wrong_key_is_an_auth_error(router):

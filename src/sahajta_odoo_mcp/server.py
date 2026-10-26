@@ -133,7 +133,8 @@ def create_http_app(settings: Settings, http: httpx.AsyncClient | None = None):
             if exc.kind == "auth":
                 # The Odoo key was revoked or expired: end this sign-in so Claude asks the person to reconnect.
                 oauth.revoke(token, "Odoo rejected the API key")
-            raise ToolError(f"{exc}. Reconnect the Odoo connector in Claude.") from exc
+                raise ToolError(f"{exc}. Reconnect the Odoo connector in Claude.") from exc
+            raise ToolError(f"{exc}. Nothing was changed; try again in a moment.") from exc
         if not identity.is_internal_user:
             raise ToolError("This Odoo account is a portal/customer account and cannot use this connector.")
         service = OdooService(shared, client, identity)

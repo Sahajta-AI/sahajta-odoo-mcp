@@ -249,22 +249,33 @@ class OdooClient:
                 await self._authenticate_jsonrpc()
             return
         # auto: probe the JSON-2 route. Odoo <= 18 answers 404, or (with the web module) a redirect to the
-        # login page, or some non-JSON page: all mean "no JSON-2 here".
-        try:
-            probe = await self._call_json2("res.users", "context_get", ids=None, context=None, kwargs={})
-            self._protocol = "json2"
-            self._probe_ctx = probe if isinstance(probe, dict) else None
-        except OdooError as exc:
-            no_json2 = exc.status == 404 or (exc.status is not None and 300 <= exc.status < 400) or exc.odoo_name is None
-            if no_json2 and exc.kind != "auth":
+        # login page, or a non-JSON page: all mean "no JSON-2 here". Anything else (busy, down, timeout,
+        # network) says nothing about the route and is passed on as it is; reading Odoo.com's 429 as
+        # "no JSON-2" once sent Odoo 19 users down the legacy path and signed them out.
+        for attempt in (1, 2):
+            try:
+                async with _gate(self.creds.url, self._max_parallel):
+                    probe = await self._call_json2("res.users", "context_get", ids=None, context=None, kwargs={})
+                self._protocol = "json2"
+                self._probe_ctx = probe if isinstance(probe, dict) else None
+                return
+            except OdooError as exc:
+                if attempt == 1 and exc.kind in ("rate_limited", "unavailable"):
+                    await asyncio.sleep(2.0)
+                    continue
+                route_missing = exc.status == 404 or (exc.status is not None and 300 <= exc.status < 400) or (
+                    exc.status == 200 and exc.odoo_name is None
+                )
+                if not route_missing:
+                    raise
                 self._protocol = "jsonrpc"
                 await self._authenticate_jsonrpc()
-            else:
-                raise
+                return
 
     async def _authenticate_jsonrpc(self) -> None:
         if not self.creds.db:
-            raise OdooError("ODOO_DB must be set to use the legacy JSON-RPC protocol", kind="auth")
+            # a server setting, not the person's key: never a reason to end their sign-in
+            raise OdooError("ODOO_DB must be set to use the legacy JSON-RPC protocol", kind="config")
         uid = await self._jsonrpc("common", "authenticate", [self.creds.db, self.creds.login, self.creds.api_key, {}])
         if not isinstance(uid, int) or not uid:
             raise OdooError(

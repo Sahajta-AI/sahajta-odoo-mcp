@@ -55,6 +55,7 @@ class OdooError(OdooMCPError):
             "rate_limited": "Odoo is rate limiting requests; wait a minute and retry",
             "unavailable": "Odoo is temporarily unavailable; try again shortly",
             "server": "Odoo reported an internal error",
+            "config": "The connector's server settings are incomplete",
         }.get(self.kind, "Odoo error")
         message = super().__str__()
         return f"{prefix}: {message}" if message else prefix
