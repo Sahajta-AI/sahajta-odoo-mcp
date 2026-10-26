@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     mcp_allow_archive: bool = False
     mcp_allow_cancel_actions: bool = False
     mcp_allow_outbound_messages: bool = False
+    mcp_admin_contact: str = Field(
+        default="Pranamya", description="Who people should ask to switch something on for Claude; named in refusals."
+    )
     mcp_default_read_limit: int = Field(default=50, ge=1)
     mcp_max_read_records: int = Field(default=200, ge=1)
     mcp_max_write_records: int = Field(default=20, ge=1)

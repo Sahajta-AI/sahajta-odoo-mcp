@@ -240,6 +240,185 @@ RECORDS: dict[str, dict[int, dict]] = {
 }
 
 
+# Setup areas (settings, e-mail templates, automation rules, accounting setup, analytic distribution), shaped like
+# Odoo 19's fields_get. Added on top of SCHEMA/RECORDS by the ``setup_fake`` fixture only, so other tests are unaffected.
+_TRIGGERS = [
+    "on_stage_set", "on_user_set", "on_tag_set", "on_state_set", "on_priority_set", "on_archive", "on_unarchive",
+    "on_create", "on_create_or_write", "on_write", "on_unlink", "on_change", "on_time", "on_time_created",
+    "on_time_updated", "on_message_received", "on_message_sent", "on_webhook",
+]
+_ACTION_TYPES = [
+    "object_write", "object_create", "object_copy", "next_activity", "mail_post", "sms", "followers",
+    "remove_followers", "code", "webhook", "multi",
+]
+SETUP_SCHEMA: dict[str, dict[str, dict]] = {
+    "ir.model": {"model": _f("char", "Model"), "name": _f("char", "Model Description")},
+    "ir.model.fields": {"name": _f("char", "Field Name"), "model": _f("char", "Model")},
+    "ir.ui.menu": {
+        "name": _f("char", "Menu", required=True),
+        "complete_name": _f("char", "Full Path", readonly=True, store=False, searchable=False),
+        "parent_id": _f("many2one", "Parent Menu", relation="ir.ui.menu"),
+    },
+    "res.config.settings": {
+        **AUDIT_FIELDS,
+        "company_id": _f("many2one", "Company", relation="res.company", required=True),
+        "group_analytic_accounting": _f("boolean", "Analytic Accounting"),
+        "group_uom": _f("boolean", "Units of Measure"),
+        "module_crm": _f("boolean", "CRM"),
+        "quotation_validity_days": _f("integer", "Default Quotation Validity"),
+        "l10n_in_gstin": _f("char", "GST Number"),
+        "l10n_in_pan": _f("char", "PAN"),
+        "auth_signup_uninvited": _f("selection", "Customer Account", selection=[["b2b", "On invitation"], ["b2c", "Free"]]),
+        "account_fiscal_country_id": _f("many2one", "Fiscal Country", relation="res.country"),
+    },
+    "mail.template": {
+        **AUDIT_FIELDS,
+        "name": _f("char", "Name"),
+        "model_id": _f("many2one", "Applies to", relation="ir.model"),
+        "subject": _f("char", "Subject"),
+        "body_html": _f("html", "Body"),
+        "email_from": _f("char", "From"),
+        "email_to": _f("char", "To (Emails)"),
+        "email_cc": _f("char", "Cc"),
+        "partner_to": _f("char", "To (Partners)"),
+        "use_default_to": _f("boolean", "Default Recipients"),
+        "reply_to": _f("char", "Reply To"),
+        "attachment_ids": _f("many2many", "Attachments", relation="ir.attachment"),
+        "mail_server_id": _f("many2one", "Outgoing Mail Server", relation="ir.mail_server"),
+    },
+    "base.automation": {
+        **AUDIT_FIELDS,
+        **CHATTER_FIELDS,
+        "name": _f("char", "Automation Rule Name", required=True),
+        "model_id": _f("many2one", "Model", relation="ir.model", required=True),
+        "model_name": _f("char", "Model Name", readonly=True, store=False),
+        "trigger": _f("selection", "Trigger", required=True, selection=[[t, t] for t in _TRIGGERS]),
+        "trigger_field_ids": _f("many2many", "Trigger Fields", relation="ir.model.fields"),
+        "trg_date_range": _f("integer", "Delay"),
+        "filter_pre_domain": _f("char", "Before Update Domain"),
+        "filter_domain": _f("char", "Apply on"),
+        "action_server_ids": _f("one2many", "Actions", relation="ir.actions.server", relation_field="base_automation_id"),
+        "record_getter": _f("char", "Record Getter"),
+        "log_webhook_calls": _f("boolean", "Log Calls"),
+        "on_change_field_ids": _f("many2many", "On Change Fields Trigger", relation="ir.model.fields"),
+        "url": _f("char", "Url", readonly=True, store=False),
+        "webhook_uuid": _f("char", "Webhook UUID", readonly=True),
+        "active": _f("boolean", "Active"),
+    },
+    "ir.actions.server": {
+        **AUDIT_FIELDS,
+        "name": _f("char", "Action Name", required=True),
+        "state": _f("selection", "Type", required=True, selection=[[t, t] for t in _ACTION_TYPES]),
+        "model_id": _f("many2one", "Model", relation="ir.model", required=True),
+        "base_automation_id": _f("many2one", "Automation Rule", relation="base.automation"),
+        "sequence": _f("integer", "Sequence"),
+        "update_path": _f("char", "Field to Update Path"),
+        "evaluation_type": _f("selection", "Value Type", selection=[["value", "Update"], ["sequence", "Sequence"], ["equation", "Compute"]]),
+        "value": _f("text", "Value"),
+        "html_value": _f("html", "Html Value"),
+        "resource_ref": _f("reference", "Record", selection=[["res.users", "User"], ["crm.stage", "Stage"], ["crm.tag", "Tag"]]),
+        "update_boolean_value": _f("selection", "Boolean Value", selection=[["true", "true"], ["false", "false"]]),
+        "update_m2m_operation": _f("selection", "Many2many Operations", selection=[["add", "Adding"], ["remove", "Removing"], ["set", "Setting it to"], ["clear", "Clearing it"]]),
+        "partner_ids": _f("many2many", "Followers", relation="res.partner"),
+        "template_id": _f("many2one", "Email Template", relation="mail.template"),
+        "mail_post_method": _f("selection", "Send Email As", selection=[["email", "Email"], ["comment", "Message"], ["note", "Note"]]),
+        "activity_type_id": _f("many2one", "Activity Type", relation="mail.activity.type"),
+        "activity_summary": _f("char", "Title"),
+        "activity_user_id": _f("many2one", "Responsible", relation="res.users"),
+        "code": _f("text", "Python Code"),
+        "webhook_url": _f("char", "Webhook URL"),
+        "webhook_sample_payload": _f("text", "Sample Payload", readonly=True, store=False),
+        "child_ids": _f("one2many", "Child Actions", relation="ir.actions.server", relation_field="parent_id"),
+        "group_ids": _f("many2many", "Allowed Groups", relation="res.groups"),
+        "usage": _f("selection", "Usage", selection=[["ir_actions_server", "Server Action"], ["base_automation", "Automation Rule"]]),
+    },
+    "mail.activity.type": {"name": _f("char", "Name")},
+    "account.tax": {
+        **AUDIT_FIELDS,
+        "name": _f("char", "Tax Name", required=True),
+        "amount": _f("float", "Amount"),
+        "type_tax_use": _f("selection", "Tax Type", selection=[["sale", "Sales"], ["purchase", "Purchases"], ["none", "None"]]),
+        "invoice_repartition_line_ids": _f("one2many", "Distribution for Invoices", relation="account.tax.repartition.line", relation_field="tax_id"),
+        "refund_repartition_line_ids": _f("one2many", "Distribution for Refunds", relation="account.tax.repartition.line", relation_field="tax_id"),
+        "tax_group_id": _f("many2one", "Tax Group", relation="account.tax.group"),
+        "active": _f("boolean", "Active"),
+    },
+    "account.tax.repartition.line": {
+        "tax_id": _f("many2one", "Tax", relation="account.tax"),
+        "factor_percent": _f("float", "%", required=True),
+        "repartition_type": _f("selection", "Based On", required=True, selection=[["base", "Base"], ["tax", "of tax"]]),
+        "document_type": _f("selection", "Document Type", required=True, selection=[["invoice", "Invoice"], ["refund", "Refund"]]),
+        "account_id": _f("many2one", "Account", relation="account.account"),
+    },
+    "account.tax.group": {"name": _f("char", "Name")},
+    "account.account": {
+        **AUDIT_FIELDS,
+        "name": _f("char", "Account Name", required=True),
+        "code": _f("char", "Code"),
+        "account_type": _f("selection", "Type", selection=[["income", "Income"], ["expense", "Expenses"]]),
+    },
+    "account.journal": {
+        **AUDIT_FIELDS,
+        "name": _f("char", "Journal Name", required=True),
+        "code": _f("char", "Short Code", required=True),
+        "type": _f("selection", "Type", required=True, selection=[["sale", "Sales"], ["bank", "Bank"], ["general", "Misc"]]),
+        "bank_account_id": _f("many2one", "Bank Account", relation="res.partner.bank"),
+        "bank_acc_number": _f("char", "Account Number", store=False),
+        "bank_id": _f("many2one", "Bank", relation="res.bank", store=False),
+    },
+    "account.move": {
+        **AUDIT_FIELDS,
+        "ref": _f("char", "Reference"),
+        "partner_id": _f("many2one", "Partner", relation="res.partner"),
+        "partner_bank_id": _f("many2one", "Recipient Bank", relation="res.partner.bank"),
+    },
+    "account.move.line": {
+        **AUDIT_FIELDS,
+        "name": _f("char", "Label"),
+        "analytic_distribution": _f("json", "Analytic Distribution"),
+        "x_other_json": _f("json", "Other JSON"),
+    },
+    "account.analytic.account": {"name": _f("char", "Analytic Account", required=True)},
+}
+SETUP_RECORDS: dict[str, dict[int, dict]] = {
+    "ir.model": {
+        90: {"model": "res.partner", "name": "Contact"},
+        91: {"model": "crm.lead", "name": "Lead/Opportunity"},
+        92: {"model": "res.users", "name": "User"},
+        93: {"model": "mail.template", "name": "Email Templates"},
+        94: {"model": "sale.order", "name": "Sales Order"},
+    },
+    "ir.ui.menu": {1: {"name": "Sales"}},
+    "base.automation": {
+        300: {"name": "Plan a call on new leads", "model_id": [91, "Lead/Opportunity"], "model_name": "crm.lead",
+              "trigger": "on_create_or_write", "action_server_ids": [400], "active": True},
+        301: {"name": "Old rule with code", "model_id": [91, "Lead/Opportunity"], "model_name": "crm.lead",
+              "trigger": "on_create_or_write", "action_server_ids": [401], "active": True},
+    },
+    "ir.actions.server": {
+        400: {"name": "Plan a call", "state": "next_activity", "model_id": [91, "Lead/Opportunity"]},
+        401: {"name": "Python thing", "state": "code", "model_id": [91, "Lead/Opportunity"], "code": "record.write({})"},
+    },
+    "mail.template": {20: {"name": "Sales: Send Quotation", "subject": "Your quotation"}},
+    "mail.activity.type": {4: {"name": "Call"}},
+    "account.analytic.account": {7: {"name": "Project Alpha"}, 8: {"name": "Project Beta"}, 31: {"name": "Marketing"}},
+    "account.account": {50: {"name": "Sales"}},
+    "account.journal": {60: {"name": "Customer Invoices", "code": "INV", "type": "sale"}},
+    "account.move": {70: {"ref": "INV/2026/0001"}},
+    "account.move.line": {700: {"name": "Licence"}},
+}
+
+
+def add_setup_models(fake: FakeOdoo) -> FakeOdoo:
+    for model, fields in SETUP_SCHEMA.items():
+        fake.schema.setdefault(model, {}).update(copy.deepcopy(fields))
+    for model, rows in SETUP_RECORDS.items():
+        for rid, row in copy.deepcopy(rows).items():
+            row.setdefault("write_date", "2026-10-15 10:00:00")
+            fake.records.setdefault(model, {})[rid] = row
+    return fake
+
+
 SALE_ORDER_FORM = """
 <form string="Sales Order">
   <header>
@@ -437,6 +616,12 @@ class FakeOdoo:
 @pytest.fixture
 def fake_odoo() -> FakeOdoo:
     return FakeOdoo()
+
+
+@pytest.fixture
+def setup_fake() -> FakeOdoo:
+    """A FakeOdoo that also has the setup-area models (settings, templates, automation rules, accounting setup)."""
+    return add_setup_models(FakeOdoo())
 
 
 @pytest.fixture
