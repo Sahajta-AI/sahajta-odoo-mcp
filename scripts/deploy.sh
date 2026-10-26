@@ -21,7 +21,12 @@ if [ -f .env ]; then
 fi
 
 echo "Running the tests..."
-.venv/bin/python -m pytest -q || fail "tests failed."
+log=$(mktemp -t sahajta-deploy-tests)
+if ! .venv/bin/python -m pytest -q -rfE >"$log" 2>&1; then
+  grep -E "^(FAILED|ERROR) " "$log" >&2 || tail -25 "$log" >&2
+  fail "tests failed (full output: $log)."
+fi
+tail -1 "$log"
 
 vercel deploy --prod --yes
 url=$(grep -E '^MCP_PUBLIC_URL=' .env 2>/dev/null | cut -d= -f2- | tr -d "\"'" || true)
