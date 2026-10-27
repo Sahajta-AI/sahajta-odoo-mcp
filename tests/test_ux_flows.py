@@ -12,6 +12,7 @@ from mcp.client import Client
 from mcp.server.mcpserver import MCPServer
 
 from conftest import AUDIT_FIELDS, CHATTER_FIELDS, FakeOdoo, _f
+from sahajta_odoo_mcp import guide
 from sahajta_odoo_mcp.errors import ConfirmationRequired, OdooError, PolicyViolation, ValidationFailed
 from sahajta_odoo_mcp.schema import REFRESH_MIN_SECONDS
 from sahajta_odoo_mcp.tools import INSTRUCTIONS, register_tools
@@ -354,7 +355,7 @@ async def test_list_actions_shows_which_buttons_finish_their_dialog_in_one_step(
     lost = (await svc.list_actions("crm.lead"))["actions"]
     assert lost == [{
         "kind": "dialog", "method": "dialog:crm.lead.lost", "label": "Lost", "opens_dialog": "crm.lead.lost",
-        "ai_can_run": False, "why_not": lost[0]["why_not"],
+        "ai_can_run": False, "why_not": lost[0]["why_not"], "guide": 'odoo_help(topic="crm")',
     }]
 
 
@@ -569,9 +570,14 @@ async def test_switched_off_changes_are_explained_without_setting_names(fake):
 
 def test_instructions_carry_the_recipes_in_plain_words():
     for needle in ("action_register_payment", "action_invoice_sent", "action_reverse", "dialog:crm.lead.lost",
-                   "purchases@", "cannot upload files", "Accounting > Bank", "account.bank.statement.line", "changes="):
+                   "changes=", "odoo_help", "vendor_bills"):
         assert needle in INSTRUCTIONS, needle
     assert "MCP_" not in INSTRUCTIONS
+    # the longer recipes now live in the guide (odoo_help), which Claude reads per area
+    settings = make_shared(mcp_access_mode="read_write").settings
+    bills, bank = guide.render("vendor_bills", settings), guide.render("bank", settings)
+    assert "Claude cannot pass files" in str(bills) and "in_invoice" in str(bills) and "ir.attachment" in str(bills)
+    assert "account.bank.statement.line" in str(bank) and "Accounting → Dashboard, open the Bank card" in str(bank)
 
 
 async def test_the_tools_take_changes_and_dialog_values(fake):

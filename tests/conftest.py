@@ -489,6 +489,8 @@ class FakeOdoo:
     filled: dict[str, dict] = field(default_factory=dict)
     # has_access answers, (model, operation) -> bool; anything not listed is allowed
     access: dict[tuple[str, str], bool] = field(default_factory=dict)
+    # the menus the user sees, {xml id: "App → Menu → Item"}, served as ir.ui.menu load_menus; None: no such call
+    menus: dict[str, str] | None = None
 
     instances = []  # class-level registry (not a dataclass field: no annotation)
 
@@ -639,6 +641,24 @@ class FakeOdoo:
 
     def _m_message_post(self, model, ids, context, **kw):
         return next(self._ids)
+
+    def _m_load_menus(self, model, ids, context, debug=False):
+        """The menu tree as Odoo's web client loads it: {"root": {...}, "<id>": {name, xmlid, children}}."""
+        if self.menus is None:
+            raise OdooError("The method load_menus does not exist", kind="missing", status=404)
+        tree: dict[str, dict] = {"root": {"id": False, "name": "root", "children": []}}
+        by_path: dict[tuple[str, ...], int] = {}
+        for xmlid, path in self.menus.items():
+            parent, trail = tree["root"], ()
+            for name in path.split(" → "):
+                trail = (*trail, name)
+                if trail not in by_path:
+                    by_path[trail] = len(by_path) + 1
+                    tree[str(by_path[trail])] = {"id": by_path[trail], "name": name, "xmlid": "", "children": []}
+                    parent["children"].append(by_path[trail])
+                parent = tree[str(by_path[trail])]
+            parent["xmlid"] = xmlid
+        return tree
 
     def _m_name_search(self, model, ids, context, name="", operator="ilike", limit=50, **kw):
         store = self._store(model)

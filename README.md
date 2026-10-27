@@ -29,7 +29,8 @@ integration (this one, Odoo's own MCP, or any community server) can connect.
 
 | Tool | What it does | Mode |
 |---|---|---|
-| `odoo_whoami` | Who am I, which company, what is allowed | always |
+| `odoo_whoami` | Who am I, which company, what is allowed, the bill inbox address | always |
+| `odoo_help` | Per area: what Claude can and cannot do, and the person's own steps in Odoo (every refusal points here) | always |
 | `odoo_list_models` | Find the model for a concept ("invoice" → `account.move`) | always |
 | `odoo_describe_model` | Fields, labels, choices, what may be written | always |
 | `odoo_search` / `odoo_read` / `odoo_count` | Find and read records | always |

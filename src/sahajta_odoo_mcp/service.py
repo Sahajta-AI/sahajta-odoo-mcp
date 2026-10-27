@@ -18,12 +18,13 @@ import time
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 
+from . import guide
 from .audit import AuditLog
 from .config import Settings
 from .confirm import ConfirmationSigner
@@ -73,6 +74,11 @@ _FILLED_IN_FIELDS = (
 )
 _TOTAL_FIELDS = ("amount_untaxed", "amount_tax", "amount_total", "tax_totals")
 _SHOWN_TEXT = 1500  # characters of an e-mail body or note shown in a preview
+_FACTS_SECONDS = 8.0  # longest a tool waits for the guide's facts from Odoo before using fixed wording
+_HELP_POINTER = (
+    "odoo_help shows, for each area, what Claude can and cannot do here and the steps to do the rest in Odoo. "
+    "Use it when the person asks what is possible, when no tool fits, and after any refusal."
+)
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +336,7 @@ class Shared:
     button_cache: dict
     state: object = None  # shared cache / single-use / rate-limit store (Redis on serverless)
     usage: object = None  # 30-day usage history (Redis only)
+    facts_cache: dict = field(default_factory=dict)  # what the guide read from each person's Odoo (see guide.py)
 
 
 class OdooService:
@@ -819,6 +826,8 @@ class OdooService:
     async def whoami(self) -> dict:
         async with self._op("odoo_whoami", "read"):
             s = self.settings
+            facts = await self._guide_facts(menus=False)
+            inboxes = facts.bill_inboxes()
             return {
                 "user": {"id": self.identity.uid, "name": self.identity.name, "login": self.identity.login},
                 "company": self.identity.company_name,
@@ -836,7 +845,59 @@ class OdooService:
                     "max_records_per_change": s.mcp_max_write_records,
                     "note": "Odoo's own access rights for this user also apply to everything.",
                 },
+                "bill_inbox": inboxes or (
+                    ("Not found: Odoo did not say" if facts.inboxes is None else "Not set up: no purchases journal has "
+                     "an e-mail address") + ". odoo_help topic vendor_bills says where it is set."
+                ),
+                "help": _HELP_POINTER,
             }
+
+    async def guide(self, topic: Any) -> dict:
+        """odoo_help: one topic of the guide, with this connection's switches and this person's Odoo filled in."""
+        async with self._op("odoo_help", "read"):
+            if guide.topic_name(topic) is None:  # before asking Odoo anything
+                raise ValidationFailed(f"there is no help topic '{topic}'. Topics: {', '.join(guide.TOPIC_NAMES)}")
+            return guide.render(topic, self.settings, await self._guide_facts(menus=True))
+
+    async def _guide_facts(self, *, menus: bool) -> guide.Facts:
+        """The bill inboxes (and, if asked, the menu paths) of this person's Odoo, read at most once an hour.
+
+        Best effort: a read that fails or is slow gives None, and the guide uses its fixed wording. Only Odoo
+        refusing the API key itself is passed on, so the sign-in still ends as it would on any other call.
+        """
+        inboxes = await self._fact("inboxes", self._read_inboxes)
+        paths = await self._fact("menus", self._read_menus) if menus else None
+        return guide.Facts(odoo_url=self.client.creds.url, inboxes=inboxes, menus=paths)
+
+    async def _fact(self, name: str, read: Callable[[], Awaitable[Any]]) -> Any:
+        key = (self.user_key, name)
+        hit = self.shared.facts_cache.get(key)
+        if hit and hit[0] > time.monotonic():
+            return hit[1]
+        try:
+            value = await asyncio.wait_for(read(), _FACTS_SECONDS)
+        except OdooError as exc:
+            if exc.key_rejected:
+                raise
+            logger.info("guide could not read %s from Odoo: %s", name, exc.kind)
+            value = None
+        except Exception as exc:  # noqa: BLE001 - only wording depends on it
+            logger.info("guide could not read %s from Odoo: %s", name, type(exc).__name__)
+            value = None
+        ttl = guide.FACTS_TTL_SECONDS if value is not None else guide.FACTS_RETRY_SECONDS
+        self.shared.facts_cache[key] = (time.monotonic() + ttl, value)
+        return value
+
+    async def _read_inboxes(self) -> tuple[guide.Inbox, ...]:
+        rows = await self.client.call(
+            "account.journal", "search_read", domain=[["type", "in", ["purchase", "sale"]]],
+            fields=["name", "type", "alias_email", "alias_name"], limit=50,
+        )
+        return guide.inboxes_from(rows)
+
+    async def _read_menus(self) -> dict[str, str]:
+        # The menus this person sees, as Odoo's web client loads them (debug: technical menus too, for admins).
+        return guide.menu_paths_from(await self.client.call("ir.ui.menu", "load_menus", debug=True))
 
     async def list_models(self, query: str | None, limit: int | None) -> dict:
         async with self._op("odoo_list_models", "read"):
@@ -928,6 +989,7 @@ class OdooService:
             }
             if write_block:
                 result["why_read_only"] = write_block
+                result["guide"] = guide.hint_call(guide.topic_for_refusal(write_block, model))
             if len(out_fields) > limit_n:
                 result["note"] = f"Showing {limit_n} of {len(out_fields)} fields; pass query to filter."
             if hidden_noise:
@@ -1127,6 +1189,8 @@ class OdooService:
                         entry = {"kind": "dialog", "method": f"dialog:{dialog.model}", "label": button.get("label"),
                                  "opens_dialog": dialog.model, **{k: v for k, v in entry.items() if k == "visible_when_not"},
                                  "ai_can_run": not why, **({"why_not": why} if why else {})}
+                if entry.get("why_not"):  # the person's own steps for a button Claude may not press
+                    entry["guide"] = guide.hint_call(guide.topic_for_refusal(entry["why_not"], model))
                 actions.append(entry)
             return {
                 "model": model,
