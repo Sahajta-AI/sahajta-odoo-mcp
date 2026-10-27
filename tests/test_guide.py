@@ -160,7 +160,12 @@ def test_a_step_needing_two_switches_shows_until_both_are_on():
 
 def test_the_admin_contact_is_named_and_previews_follow_their_setting():
     text = str(guide.render("vendor_bills", build_settings(mcp_admin_contact="Shubhang")))
-    assert "ask Shubhang" in text  # the bill inbox fallback says whom to ask
+    # setting up the bill inbox is Odoo administration; the connector contact is for the connector's own switches
+    [inbox] = [line for line in guide.render("vendor_bills", build_settings(mcp_admin_contact="Shubhang"))["yourself"]
+               if line.startswith("Bill inbox")]
+    assert "ask your Odoo administrator" in inbox and "Shubhang" not in inbox
+    off = str(guide.render("overview", build_settings(**SWITCHES_OFF, mcp_admin_contact="Shubhang")))
+    assert "Ask Shubhang to switch it on" in off
     assert mentions(guide.render("limits", build_settings(**SWITCHES_OFF))["can"], "only after your yes")
     loose = guide.render("limits", build_settings(**SWITCHES_OFF, mcp_require_preview=False))
     assert mentions(loose["can"], "Previews are optional") and not mentions(loose["can"], "only after your yes")
@@ -483,3 +488,17 @@ def test_the_instructions_say_never_just_no_and_stay_short():
     assert "Never just say something is not possible" in INSTRUCTIONS and "one item at a time" in INSTRUCTIONS
     assert "odoo_help" in INSTRUCTIONS and "Accounting > Bank" not in INSTRUCTIONS
     assert len(INSTRUCTIONS) < 5000
+
+
+def test_developer_mode_menus_are_not_reported_as_missing():
+    """Odoo lists technical menus only in developer mode, so their absence must not read as 'no access'."""
+    facts = guide.Facts(menus={"account.menu_action_move_in_invoice_type": "Accounting → Vendors → Bills"})
+    email = guide.render("email", build_settings(), facts)
+    assert "Settings → Technical → Email → Email Templates (developer mode)" in str(email)
+    assert "Not in your Odoo menus" not in str(email)
+
+
+def test_menu_names_ending_in_an_ellipsis_read_cleanly():
+    tree = {"root": {"children": [1]}, "1": {"name": "Accounting", "children": [2]},
+            "2": {"name": "Lock Dates…", "xmlid": "account_accountant.menu_action_change_lock_date", "children": []}}
+    assert guide.menu_paths_from(tree)["account_accountant.menu_action_change_lock_date"] == "Accounting → Lock Dates"

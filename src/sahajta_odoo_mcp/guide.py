@@ -113,7 +113,7 @@ def menu_paths_from(menus: Any) -> dict[str, str]:
             child = by_id.get(str(child_id))
             if not child or depth > 8:
                 continue
-            here = (*trail, str(child.get("name") or "").strip()[:60])
+            here = (*trail, str(child.get("name") or "").strip().rstrip("…").rstrip(".").strip()[:60])
             if isinstance(child.get("xmlid"), str) and child["xmlid"]:
                 paths.setdefault(child["xmlid"], " → ".join(here))
             walk(child, here, depth + 1)
@@ -518,7 +518,7 @@ TOPICS: dict[str, Topic] = {
             "Matching and undoing a match happen in Odoo's bank screen: {menu:account.menu_board_journal_1}, open "
             "the Bank card.",
             "Bank matching rules are managed from that bank matching screen.",
-            "Bank feeds and bank account details: ask {admin}.",
+            "Bank feeds and bank account details are set in Odoo by your Odoo administrator.",
         ),
         needs=(
             "Which bank account.",
@@ -601,7 +601,7 @@ TOPICS: dict[str, Topic] = {
             "Send a quotation: open it, click Send.",
             Step("Send an invoice: open it, click Send.", unless="outbound"),
             Step("Message a customer: open the record, click Send message beside the messages.", unless="outbound"),
-            "Inbox addresses, mass mailing, SMS and WhatsApp: ask {admin}.",
+            "Inbox addresses, mass mailing, SMS and WhatsApp are set up in Odoo by your Odoo administrator.",
         ),
         needs=(
             "Which record or template.",
@@ -730,10 +730,10 @@ TOPICS: dict[str, Topic] = {
             ("Do what your own Odoo user may not do", "Claude works with your Odoo access, never more"),
         ),
         yourself=_steps(
-            "Users and access rights: {menu:base.menu_action_res_users} (an Odoo administrator does this; ask {admin}).",
+            "Users and access rights: {menu:base.menu_action_res_users} (your Odoo administrator does this).",
             "Your API key: click your profile picture (top right) → My Preferences → Security tab → Create API Key "
             "(Account Security and New API Key in older versions).",
-            "If Odoo refused because of your access: ask {admin} to give your user that access, or ask a colleague "
+            "If Odoo refused because of your access: ask your Odoo administrator to give your user that access, or ask a colleague "
             "who has it to do the step.",
         ),
         needs=(
@@ -930,7 +930,8 @@ class _Writer:
         path = (menus or {}).get(xmlid)
         if not path:
             path = fallback
-            if menus is not None and fallback not in self.not_in_menus:
+            # technical menus are only listed in developer mode, so their absence says nothing about access
+            if menus is not None and not technical and fallback not in self.not_in_menus:
                 self.not_in_menus.append(fallback)
         return f"{path} (developer mode)" if technical else path
 
@@ -977,9 +978,9 @@ class _Writer:
         if named:
             return (
                 f"the bill inbox of your purchases journal (Odoo has the inbox name '{named[0]}' but no e-mail "
-                f"domain, so e-mails cannot reach it yet; {{admin}} can set it up: {where}, Configure Alias Domain)"
+                f"domain, so e-mails cannot reach it yet; your Odoo administrator can set it up: {where}, Configure Alias Domain)"
             )
-        return f"the bill inbox address of your purchases journal ({where}; if it is empty, ask {{admin}})"
+        return f"the bill inbox address of your purchases journal ({where}; if it is empty, ask your Odoo administrator)"
 
     def sales_inbox_step(self) -> str:
         addresses = [box.email for box in self.facts.inboxes or () if box.kind == "sale" and box.email]
@@ -1034,7 +1035,7 @@ def render(topic: str | None, settings: Settings, facts: Facts | None = None) ->
     if writer.not_in_menus:
         result["yourself"].append(writer.text(
             f"Not in your Odoo menus: {'; '.join(writer.not_in_menus)}. Your user may not have access, or the app "
-            "is not installed: ask {admin}."
+            "is not installed: ask your Odoo administrator."
         ))
     if writer.used_menus and (facts is None or facts.menus is None):
         result["yourself"].append("Menu names are Odoo's usual ones; yours may differ slightly.")
