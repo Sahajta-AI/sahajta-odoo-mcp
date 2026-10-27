@@ -63,3 +63,32 @@ async def test_a_payment_dialog_holding_a_saved_card_is_refused_in_two_steps_too
     svc = make_service(fake, mcp_access_mode="read_write")
     with pytest.raises(PolicyViolation, match="saved card"):
         await svc.preview_action("account.payment.register", [80], "action_create_payments", None)
+
+
+def _with_matching_rules(fake: FakeOdoo) -> FakeOdoo:
+    fake.schema["account.reconcile.model"] = {
+        **AUDIT_FIELDS,
+        "name": _f("char", "Name", required=True),
+        "active": _f("boolean", "Active"),
+        "match_label_param": _f("char", "Label Parameter"),
+        "trigger": _f("selection", "Trigger", selection=[["manual", "Manual"], ["auto_reconcile", "Automated"]]),
+    }
+    fake.records["account.reconcile.model"] = {90: {"name": "Bank fees", "trigger": "manual", "active": True}}
+    return fake
+
+
+async def test_editing_a_matching_rule_previews_with_its_warnings(fake):
+    svc = make_service(_with_matching_rules(fake), mcp_access_mode="read_write")
+    preview = await svc.preview_update("account.reconcile.model", [90], {"match_label_param": "BANK CHG"}, None)
+    assert "past entries stay as they are" in str(preview) and "Sets this rule to Automated" not in str(preview)
+    preview = await svc.preview_update("account.reconcile.model", [90], {"trigger": "auto_reconcile"}, None)
+    assert "Sets this rule to Automated" in str(preview)
+    await svc.update("account.reconcile.model", [90], {"trigger": "auto_reconcile"}, None, preview["confirm_token"])
+    assert fake.records["account.reconcile.model"][90]["trigger"] == "auto_reconcile"
+
+
+async def test_other_accounting_setup_stays_create_only(fake):
+    svc = make_service(fake, mcp_access_mode="read_write")
+    fake.records["account.tax"] = {1: {"name": "GST 18%"}}
+    with pytest.raises(PolicyViolation, match="past reports and GST returns"):
+        await svc.preview_update("account.tax", [1], {"name": "GST 18% S"}, None)

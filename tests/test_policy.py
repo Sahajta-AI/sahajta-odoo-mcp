@@ -135,7 +135,6 @@ def test_invalid_model_names_are_refused(model, everything_on):
     "model",
     [
         "ir.ui.view",
-        "ir.attachment",
         "ir.sequence",
         "ir.model.fields",
         "res.users",
@@ -942,7 +941,7 @@ def test_replying_to_messages_with_messages_is_refused_to_avoid_mail_loops():
 @pytest.mark.parametrize(
     "model, name",
     [("account.account", "Accounts"), ("account.tax", "Taxes"), ("account.fiscal.position", "Fiscal positions"),
-     ("account.reconcile.model", "Reconciliation models"), ("account.journal", "Journals")],
+     ("account.journal", "Journals")],
 )
 def test_accounting_setup_is_create_only(model, name, everything_on):
     everything_on.check_write(model)
@@ -1036,7 +1035,7 @@ def test_change_warnings_for_templates_rules_and_accounting_setup(rw):
         (warning,) = rw.change_warnings("base.automation", mode, ["name", "filter_domain"])
         assert "runs automatically from now on, on every matching record, without asking" in warning
     assert "Archiving stops the rule" in rw.change_warnings("base.automation", "write", ["active"])[0]
-    for model in ("account.account", "account.tax", "account.fiscal.position", "account.reconcile.model", "account.journal"):
+    for model in ("account.account", "account.tax", "account.fiscal.position", "account.journal"):
         (warning,) = rw.change_warnings(model, "create", ["name"])
         assert "every future entry" in warning and "CA" in warning
 
@@ -1147,3 +1146,41 @@ def test_every_previously_protected_area_is_still_protected(prefix, everything_o
     if exact not in LIMITED_MODELS and everything_on.model_read_block_reason(exact) is None:
         with pytest.raises(PolicyViolation):
             everything_on.check_write(exact)
+
+
+def test_bank_matching_rules_can_be_created_edited_and_archived_but_not_buttoned(everything_on):
+    model = "account.reconcile.model"
+    everything_on.check_write(model)
+    assert everything_on.change_block_reason(model, "create") is None
+    assert everything_on.change_block_reason(model, "write") is None
+    assert everything_on.field_write_block_reason("active", {"type": "boolean"}, model=model) is None
+    assert everything_on.nested_write_block_reason(model, "line_ids", "account.reconcile.model.line", creating=False) is None
+    assert decide(everything_on, "action_archive", model=model).allowed is False  # buttons stay closed
+
+
+def test_bank_matching_rules_archive_only_with_the_archive_switch(rw):
+    reason = rw.field_write_block_reason("active", {"type": "boolean"}, model="account.reconcile.model")
+    assert reason and "archiving is switched off" in reason
+
+
+def test_bank_matching_rule_previews_warn_and_flag_automated(rw):
+    (general,) = rw.change_warnings("account.reconcile.model", "write", ["name"], [{"name": "Bank fees"}])
+    assert "from now on" in general and "past entries stay as they are" in general and "Automated" in general
+    automated, _ = rw.change_warnings("account.reconcile.model", "write", ["trigger"], [{"trigger": "auto_reconcile"}])
+    assert automated.startswith("Sets this rule to Automated") and "without anyone checking" in automated
+    assert len(rw.change_warnings("account.reconcile.model", "create", ["trigger"], [{"trigger": "manual"}])) == 1
+
+
+def test_files_can_only_be_moved_never_uploaded_edited_or_buttoned(everything_on):
+    model = "ir.attachment"
+    everything_on.check_write(model)  # moving a file = changing which record it is on
+    assert "cannot be uploaded" in everything_on.change_block_reason(model, "create")
+    assert everything_on.change_block_reason(model, "write") is None
+    for name in ("res_model", "res_id"):
+        assert everything_on.field_write_block_reason(name, {"type": "char"}, model=model) is None
+    for name, ftype in (("datas", "binary"), ("name", "char"), ("public", "boolean"), ("res_field", "char"), ("type", "selection")):
+        assert "only these fields" in everything_on.field_write_block_reason(name, {"type": ftype}, model=model)
+    decision = decide(everything_on, "action_open", model=model)
+    assert decision.allowed is False and "move a file" in decision.reason
+    (warning,) = everything_on.change_warnings(model, "write", ["res_id", "res_model"])
+    assert "nothing is deleted" in warning

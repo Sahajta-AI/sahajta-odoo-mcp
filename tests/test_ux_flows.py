@@ -569,7 +569,7 @@ async def test_switched_off_changes_are_explained_without_setting_names(fake):
 
 def test_instructions_carry_the_recipes_in_plain_words():
     for needle in ("action_register_payment", "action_invoice_sent", "action_reverse", "dialog:crm.lead.lost",
-                   "purchases@", "cannot attach files", "Accounting > Bank", "account.bank.statement.line", "changes="):
+                   "purchases@", "cannot upload files", "Accounting > Bank", "account.bank.statement.line", "changes="):
         assert needle in INSTRUCTIONS, needle
     assert "MCP_" not in INSTRUCTIONS
 

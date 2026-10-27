@@ -69,14 +69,23 @@ Recipes (find the record ids first; each is one preview, one approval, one commi
   crm.lost.reason>} (and "lost_feedback" for a note).
 - Invoice a confirmed order: model sale.order, method "dialog:sale.advance.payment.inv". It creates a draft invoice.
 - Vendor bills: the easy way is to forward the vendor's PDF to the company's purchases@ bill inbox; Odoo then
-  creates a draft bill with the PDF attached. This connector cannot attach files. To type one in instead:
+  creates a draft bill with the PDF attached. This connector cannot upload files. To type one in instead:
   odoo_preview_create model account.move with move_type "in_invoice", partner_id, invoice_date, ref (the vendor's
   bill number) and invoice_line_ids [{"product_id" or "name", "quantity", "price_unit", "tax_ids"}].
+- Put a PDF on the right bill or entry: files already in Odoo (on a draft bill, e.g. from the bill inbox, or on no
+  record) can be moved onto a bill, invoice or journal entry. Find the file (ir.attachment: name, res_model, res_id),
+  then odoo_preview_update model ir.attachment with values {"res_model": "account.move", "res_id": <entry id>}; for
+  several files going to different entries, one preview with changes [{"ids": [file], "values": {...}}, ...]. Files on
+  posted entries and PDFs Odoo generated itself stay where they are. Afterwards, tell the person which emptied draft
+  bills they may delete in Odoo (Claude cannot delete).
 - Bank reconciliation help: matching (and undoing a match) happens in Odoo's own screen, Accounting > Bank. To
   prepare it: find unmatched lines (account.bank.statement.line, is_reconciled = false), find the open bill or
   invoice for each (account.move, state posted, payment_state not_paid or partial, same amount and partner or
   reference), set partner_id on each statement line (one odoo_preview_update with changes) so Odoo's matching
   screen suggests that bill, then tell the person which pairs to confirm there.
+- Bank matching rules (account.reconcile.model, with line_ids for what they book) can be created, edited and
+  archived through the usual previews. A rule whose trigger is "auto_reconcile" (Automated) books matching bank
+  lines with nobody reviewing: say so plainly and keep its conditions narrow.
 """
 
 _READ = dict(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)

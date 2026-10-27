@@ -8,7 +8,8 @@ Two layers:
     no cancelling, no outbound e-mail/SMS).
 
 A few setup areas are open within limits (see "Setup areas" below): app settings, e-mail
-template texts, automation rules without code, and new accounting setup. Every change
+template texts, automation rules without code, new accounting setup, bank matching rules, and moving
+files onto accounting entries. Every change
 there still goes through preview and approval.
 
 Odoo's own access rights still apply on top of all of this: the server can never
@@ -193,8 +194,16 @@ SERVER_ACTION_MODEL = "ir.actions.server"
 # Accounting setup: new records may be created; existing ones are never changed or archived through Claude,
 # because entries already use them.
 CREATE_ONLY_MODELS: frozenset[str] = frozenset(
-    {"account.account", "account.tax", "account.fiscal.position", "account.reconcile.model", "account.journal"}
+    {"account.account", "account.tax", "account.fiscal.position", "account.journal"}
 )
+# Bank matching rules may also be edited and archived: they only decide how future bank lines are matched,
+# never past entries. Their buttons stay closed.
+RECONCILE_MODEL = "account.reconcile.model"
+# Files (e.g. a bill's PDF) can be moved onto an accounting entry: only which record they are on changes, never
+# their content, and nothing is uploaded or deleted. Where they may come from is checked against Odoo by the
+# service (a draft entry, or no record at all).
+ATTACHMENT_MODEL = "ir.attachment"
+ATTACHMENT_TARGETS: frozenset[str] = frozenset({"account.move"})
 _SETUP_NAMES: dict[str, str] = {
     "account.account": "Accounts",
     "account.tax": "Taxes",
@@ -204,7 +213,9 @@ _SETUP_NAMES: dict[str, str] = {
 }
 
 # Models these rules open, although their prefix is protected or they were blocked before.
-LIMITED_MODELS: frozenset[str] = CREATE_ONLY_MODELS | {SETTINGS_MODEL, TEMPLATE_MODEL, AUTOMATION_MODEL}
+LIMITED_MODELS: frozenset[str] = CREATE_ONLY_MODELS | {
+    SETTINGS_MODEL, TEMPLATE_MODEL, AUTOMATION_MODEL, RECONCILE_MODEL, ATTACHMENT_MODEL,
+}
 
 # Lines that may be written only inside their parent record, through these fields (never on their own).
 NESTED_LINES: dict[tuple[str, str], str] = {
@@ -220,6 +231,7 @@ _LINE_PARENTS: dict[str, tuple[str, str]] = {line: parent for parent, line in NE
 
 # On these models only the listed fields may be written; all others stay read-only.
 FIELD_ALLOWLISTS: dict[str, frozenset[str]] = {
+    ATTACHMENT_MODEL: frozenset({"res_model", "res_id"}),
     TEMPLATE_MODEL: frozenset({"subject", "body_html", "email_to", "email_cc", "partner_to", "use_default_to", "reply_to"}),
     AUTOMATION_MODEL: frozenset(
         {
@@ -256,9 +268,11 @@ LIMITED_BUTTONS: dict[str, frozenset[str]] = {
     SETTINGS_MODEL: frozenset({"execute"}),  # the settings screen's Save (drawn by Odoo's web client, not the view)
     TEMPLATE_MODEL: frozenset(),
     AUTOMATION_MODEL: frozenset(),
-    **{model: frozenset() for model in CREATE_ONLY_MODELS},
+    **{model: frozenset() for model in CREATE_ONLY_MODELS | {RECONCILE_MODEL, ATTACHMENT_MODEL}},
 }
 _BUTTONS_REFUSED: dict[str, str] = {
+    ATTACHMENT_MODEL: "Buttons on files cannot be pressed through Claude. Claude can only move a file onto a bill, "
+    "invoice or journal entry.",
     SETTINGS_MODEL: "Only the settings screen's Save button (execute) can be pressed through Claude; the other "
     "settings buttons open or install things. Use them in Odoo.",
     TEMPLATE_MODEL: "Buttons on e-mail templates cannot be pressed through Claude. Claude can only change a "
@@ -571,6 +585,11 @@ class SafetyPolicy:
         """Why creating (mode 'create') or changing existing records (any other mode) is refused on a model
         that model_write_block_reason lets through: the limited setup areas."""
         if mode == "create":
+            if model == ATTACHMENT_MODEL:
+                return (
+                    "Files cannot be uploaded through Claude. Upload them in Odoo, or forward a bill's PDF to the bill "
+                    "inbox (it becomes a draft bill); Claude can then move a file onto the right bill or entry."
+                )
             if model == TEMPLATE_MODEL:
                 return (
                     "New e-mail templates cannot be created through Claude. Claude can change the subject, body and "
@@ -794,12 +813,28 @@ class SafetyPolicy:
 
     # -- previews -----------------------------------------------------------------------
 
-    def change_warnings(self, model: str, mode: str, field_names: Iterable[str]) -> list[str]:
+    def change_warnings(
+        self, model: str, mode: str, field_names: Iterable[str], values: Iterable[dict] | None = None
+    ) -> list[str]:
         """Plain-language warnings for a preview of a change to the limited setup areas. Pure: no Odoo calls.
 
-        mode is 'create' or 'write' (also 'update'); field_names are the fields the change sets.
+        mode is 'create' or 'write' (also 'update'); field_names are the fields the change sets; values, when
+        given, are the new values (one dict per record or per group of records).
         """
         names = sorted({str(name) for name in field_names or ()})
+        if model == ATTACHMENT_MODEL:
+            return ["Each file leaves the record it is on now. It can be moved back the same way; nothing is deleted."]
+        if model == RECONCILE_MODEL:
+            warnings = [
+                "Changes how Odoo matches bank lines from now on (past entries stay as they are). If this rule is "
+                "Automated, Odoo applies it to matching bank lines on its own, with nobody reviewing them."
+            ]
+            if any(isinstance(v, dict) and v.get("trigger") == "auto_reconcile" for v in values or ()):
+                warnings.insert(0, (
+                    "Sets this rule to Automated: from now on Odoo books every bank line that matches it on its own, "
+                    "without anyone checking. Make sure the conditions are narrow."
+                ))
+            return warnings
         if model == SETTINGS_MODEL:
             groups = [name for name in names if name.startswith("group_")]
             if groups:

@@ -62,9 +62,16 @@ standing):
   refused; a rule that already contains code can't be edited through Claude. Scheduled actions stay closed.
 * Analytic distribution (`analytic_distribution` JSON on lines): existing analytic accounts, percentages above 0
   and up to 100.
-* Accounting setup, create-only: accounts, taxes (with their lines), fiscal positions, reconciliation models and
-  journals can be created, never edited or archived (editing setup already used changes past reports and GST
-  returns). Journal bank fields stay closed.
+* Accounting setup, create-only: accounts, taxes (with their lines), fiscal positions and journals can be
+  created, never edited or archived (editing setup already used changes past reports and GST returns). Journal
+  bank fields stay closed.
+* Bank matching rules (`account.reconcile.model`, with their lines): created, edited and archived (archiving needs
+  the archive switch). They only decide how future bank lines are matched, never past entries. Previews warn, and
+  flag a rule set to Automated, which books matching bank lines with nobody reviewing. Their buttons stay closed.
+* Files (`ir.attachment`): moved only, never uploaded, renamed, rewritten or deleted. Only `res_model`/`res_id`
+  change; a file may leave a draft entry or no record, never a posted entry, another kind of record, or a file
+  Odoo keeps in a field (such as the invoice PDF it generated); it may go only onto a bill, invoice or journal
+  entry. The preview lists each file's from and to; the target then shows it as its main document.
 
 **Readable but never writable**: other accounting configuration (report definitions, payment methods, decimal
 precision), existing accounting setup (see above), bank details anywhere (any field pointing at a bank account),

@@ -31,7 +31,7 @@ from .deadline import CALL_STARTED, SEND_BY
 from .errors import NotSent, OdooError, OdooMCPError, PolicyViolation, ValidationFailed
 from .formatting import UNTRUSTED_NOTE, Formatter, html_to_text
 from .odoo_client import OdooClient, OdooIdentity
-from .policy import CREATE_ONLY_FIELDS, SafetyPolicy, is_sensitive_field
+from .policy import ATTACHMENT_MODEL, ATTACHMENT_TARGETS, CREATE_ONLY_FIELDS, SafetyPolicy, is_sensitive_field
 from .ratelimit import RateLimiter
 from .schema import SchemaCache
 from .validation import Validator
@@ -650,13 +650,15 @@ class OdooService:
                 f"this server is read-only for Claude: changing records is switched off; ask {self.settings.mcp_admin_contact} if it is needed"
             )
 
-    def _change_warnings(self, model: str, mode: str, field_names: list[str]) -> list[str]:
+    def _change_warnings(
+        self, model: str, mode: str, field_names: list[str], values: list[dict] | None = None
+    ) -> list[str]:
         """Plain-language warnings every change preview shows about this kind of change.
 
         The single place to add more of them (e.g. policy.change_warnings(model, mode, field_names)).
         mode: "create", "write" or "action".
         """
-        return self.policy.change_warnings(model, mode, field_names)
+        return self.policy.change_warnings(model, mode, field_names, values)
 
     async def _odoo_allows(self, model: str, operation: str, ids: list[int] | None = None) -> None:
         """Refuses in the preview what Odoo's access rights for this user would refuse after the approval.
@@ -1280,7 +1282,9 @@ class OdooService:
                 warnings.extend(f"record {index}: Odoo says: {text}" for text in seen["odoo_says"])
             if unknown:
                 warnings.extend(await self._missing_required(model, unknown, ctx))
-            warnings.extend(self._change_warnings(model, "create", sorted({name for values in normalized for name in values})))
+            warnings.extend(self._change_warnings(
+                model, "create", sorted({name for values in normalized for name in values}), normalized
+            ))
             result: dict[str, Any] = {
                 "preview": f"Create {len(normalized)} new {model} record(s)",
                 "records": [await self._describe_values(model, values) for values in normalized],
@@ -1405,6 +1409,95 @@ class OdooService:
             groups.append((change["ids"], change["values"]))
         return groups
 
+    async def _file_moves(self, groups: list[tuple[list[int], dict]]) -> list[dict]:
+        """Checks that each file may be moved, and describes the moves for the preview.
+
+        A file may leave only a draft entry, or no record at all (e.g. one uploaded on its own): never a posted
+        entry, another kind of record, or a file Odoo keeps in a field (such as the invoice PDF it generated).
+        It may go only onto a bill, invoice or journal entry.
+        """
+        for _, values in groups:
+            if set(values) != {"res_model", "res_id"} or values.get("res_model") not in ATTACHMENT_TARGETS or not (
+                isinstance(values.get("res_id"), int) and not isinstance(values.get("res_id"), bool) and values["res_id"] > 0
+            ):
+                raise ValidationFailed(
+                    "a file can only be moved onto a bill, invoice or journal entry: give values "
+                    "{\"res_model\": \"account.move\", \"res_id\": <the entry's id>}"
+                )
+        ids = [i for group_ids, _ in groups for i in group_ids]
+        rows = await self.client.call(ATTACHMENT_MODEL, "read", ids=ids, fields=["name", "res_model", "res_id", "res_field"])
+        files = {row["id"]: row for row in rows or []}
+        targets = {values["res_id"] for _, values in groups}
+        sources = {row["res_id"] for row in files.values() if row.get("res_model") == "account.move" and row.get("res_id")}
+        moves_found = await self.client.call(
+            "account.move", "read", ids=sorted(targets | sources), fields=["display_name", "state"],
+            context={"active_test": False},
+        )
+        entries = {row["id"]: row for row in moves_found or []}
+        problems, described = [], []
+        for group_ids, values in groups:
+            target = entries.get(values["res_id"])
+            if target is None:
+                problems.append(f"account.move record {values['res_id']} does not exist or is not visible to you")
+                continue
+            for file_id in group_ids:
+                row = files.get(file_id, {})
+                name = row.get("name") or f"file {file_id}"
+                if row.get("res_field"):
+                    problems.append(f"'{name}' is a file Odoo keeps itself (e.g. a generated PDF); it cannot be moved")
+                    continue
+                source_model, source_id = row.get("res_model") or None, row.get("res_id") or None
+                if source_model and source_id:
+                    if source_model != "account.move":
+                        problems.append(
+                            f"'{name}' is on a {source_model} record; only files on draft bills or entries, or on no "
+                            "record, can be moved"
+                        )
+                        continue
+                    source = entries.get(source_id) or {}
+                    if source.get("state") != "draft":
+                        problems.append(
+                            f"'{name}' is on {source.get('display_name') or source_id}, which is not a draft; files on "
+                            "posted or cancelled entries stay where they are"
+                        )
+                        continue
+                    if source_id == values["res_id"]:
+                        problems.append(f"'{name}' is already on {target['display_name']}")
+                        continue
+                    origin = {"from": source.get("display_name"), "from_link": self._link("account.move", source_id)}
+                else:
+                    origin = {"from": "not attached to any record"}
+                described.append({
+                    "file": name, **origin, "to": target["display_name"], "to_link": self._link("account.move", target["id"]),
+                })
+        if problems:
+            raise ValidationFailed(problems)
+        return described
+
+    async def _show_moved_files(self, groups: list[tuple[list[int], dict]], sources: list[int]) -> None:
+        """After files were moved: each target entry without a main document shows the moved file (the PDF
+        next to a bill), and each draft a file left stops pointing at it. Only those records are touched.
+        Best effort: the move itself is done."""
+        moved = {i for group_ids, _ in groups for i in group_ids}
+        try:
+            for group_ids, values in groups:
+                target = values["res_id"]
+                rows = await self.client.call("account.move", "read", ids=[target], fields=["message_main_attachment_id"])
+                if rows and not rows[0].get("message_main_attachment_id"):
+                    await self.client.call(
+                        "account.move", "write", ids=[target], vals={"message_main_attachment_id": group_ids[0]}
+                    )
+            if sources:
+                rows = await self.client.call("account.move", "read", ids=sources, fields=["state", "message_main_attachment_id"])
+                stale = [
+                    r["id"] for r in rows or []
+                    if r.get("state") == "draft" and _id_of(r.get("message_main_attachment_id")) in moved
+                ]
+                if stale:
+                    await self.client.call("account.move", "write", ids=stale, vals={"message_main_attachment_id": False})
+        except Exception as exc:  # noqa: BLE001 - the files are moved; only the side-by-side view is not updated
+            logger.warning("could not set the main document after moving files: %s", type(exc).__name__)
+
     async def _prepare_update(
         self, model: str, ids: Any, values: Any, context: Any, changes: Any = None
     ) -> tuple[list[tuple[list[int], dict]], dict, dict]:
@@ -1431,6 +1524,8 @@ class OdooService:
             (group_ids, await self.validator.normalize_values(model, group_values, mode="write", record_ids=group_ids))
             for group_ids, group_values in groups
         ]
+        if model == ATTACHMENT_MODEL:
+            await self._file_moves(normalized_groups)
         fingerprint = await self._fingerprint(model, all_ids, list(dict.fromkeys(n for _, norm in normalized_groups for n in norm)))
         fields_meta = await self._fields(model)
         for _, normalized in normalized_groups:
@@ -1473,7 +1568,11 @@ class OdooService:
                 "preview": f"Update {len(all_ids)} {model} record(s)" + (f" in {len(groups)} different ways" if len(groups) > 1 else ""),
                 "changes": preview_changes,
             }
-            warnings = self._change_warnings(model, "write", list(dict.fromkeys(n for _, norm in groups for n in norm)))
+            if model == ATTACHMENT_MODEL:
+                result = {"preview": f"Move {len(all_ids)} file(s)", "moves": await self._file_moves(groups)}
+            warnings = self._change_warnings(
+                model, "write", list(dict.fromkeys(n for _, norm in groups for n in norm)), [norm for _, norm in groups]
+            )
             if warnings:
                 result["warnings"] = warnings
             result["confirm_token"] = self.shared.signer.issue(payload)
@@ -1499,8 +1598,14 @@ class OdooService:
                 send = lambda: self.client.call(  # noqa: E731
                     model, "web_save_multi", ids=all_ids, vals_list=vals_list, specification={}, context=call_ctx
                 )
+            sources: list[int] = []
+            if model == ATTACHMENT_MODEL:  # the drafts the files leave, noted before they move
+                rows = await self.client.call(ATTACHMENT_MODEL, "read", ids=all_ids, fields=["res_model", "res_id"])
+                sources = sorted({r["res_id"] for r in rows or [] if r.get("res_model") == "account.move" and r.get("res_id")})
             token = self._approve(confirm_token, payload)
             await self._send(attempt, token, send, check=lambda: self._now_shows(model, all_ids, scalar))
+            if model == ATTACHMENT_MODEL:
+                await self._show_moved_files(groups, sources)
             try:
                 updated = await self._in_time(self._summaries(model, all_ids, scalar, check=False), attempt)
             except Exception as exc:  # the change went through: a failed or odd read must not turn this into an error
@@ -1989,3 +2094,10 @@ class OdooService:
             )
             message_id = message_id[0] if isinstance(message_id, list) and message_id else message_id
             return {"message_id": message_id, "message": "Message posted; Odoo notifies the record's followers."}
+
+
+def _id_of(value: Any) -> int | None:
+    """The id in a many2one value as Odoo returns it ([id, name]) or as an id."""
+    if isinstance(value, (list, tuple)) and value:
+        value = value[0]
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
