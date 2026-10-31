@@ -70,6 +70,13 @@ def test_recording_never_raises():
     UsageLog(BrokenRedis(redis.ConnectionError("down"))).record({"user": "a", "tool": "odoo_count", "outcome": "ok"})
 
 
+def test_follower_changes_count_as_changes():
+    log = make_log()
+    log.record({"user": "s@x", "tool": "odoo_change_followers", "outcome": "ok", "model": "crm.lead", "ids": [1, 2]})
+    log.record({"user": "s@x", "tool": "odoo_preview_followers", "outcome": "ok", "model": "crm.lead", "ids": [1, 2]})
+    assert log.report(7)["changes"] == {"followers": 1}
+
+
 def test_report_aggregates_and_formats():
     log = make_log()
     for tool, outcome, model, ids in [

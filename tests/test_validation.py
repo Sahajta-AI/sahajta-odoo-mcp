@@ -1146,10 +1146,13 @@ async def test_templates_take_text_and_recipient_changes_only(setup_fake):
         "reply_to": "sales@sahajta.com",
     }
     assert await v.normalize_values("mail.template", values, mode="write", record_ids=[20]) == values
-    for name, value in [("email_from", "ceo@elsewhere.example"), ("attachment_ids", [1]), ("model_id", 90), ("name", "x")]:
+    for name, value in [("email_from", "ceo@elsewhere.example"), ("attachment_ids", [1])]:
         await rejected(v.normalize_values("mail.template", {name: value}, mode="write", record_ids=[20]), "only these fields")
-    with pytest.raises(PolicyViolation, match="cannot be created"):
-        await v.normalize_values("mail.template", {"subject": "x"}, mode="create")
+        await rejected(v.normalize_values("mail.template", {name: value}, mode="create"), "only these fields")
+    for name, value in [("model_id", 90), ("name", "x")]:  # a new template's, never changed afterwards
+        await rejected(v.normalize_values("mail.template", {name: value}, mode="write", record_ids=[20]), "only when the record is created")
+    created = {"name": "Follow-up", "model_id": 94, "subject": "x"}
+    assert await v.normalize_values("mail.template", created, mode="create") == created
 
 
 # ================================================================================ accounting setup and bank details

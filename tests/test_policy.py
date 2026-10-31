@@ -804,15 +804,33 @@ def test_the_settings_save_button_is_the_only_one_and_needs_no_view_button(rw):
 # =============================================================================== setup areas: e-mail templates
 
 
-def test_templates_can_be_edited_in_listed_fields_but_never_created(rw):
+def test_templates_can_be_edited_in_listed_fields_and_created_with_a_name_and_model(rw):
     rw.check_write("mail.template")
     assert rw.change_block_reason("mail.template", "write") is None
-    assert "cannot be created" in rw.change_block_reason("mail.template", "create")
+    assert rw.change_block_reason("mail.template", "create") is None  # its model is checked by the service
     for name in ("subject", "body_html", "email_to", "email_cc", "partner_to", "use_default_to", "reply_to"):
         assert rw.field_write_block_reason(name, {"type": "char"}, model="mail.template") is None, name
-    for name in ("email_from", "model_id", "attachment_ids", "report_template_ids", "lang", "auto_delete", "name"):
-        reason = rw.field_write_block_reason(name, {"type": "char"}, model="mail.template")
-        assert reason and "only these fields" in reason, name
+    for name in ("name", "model_id"):  # set when a template is created, never changed afterwards
+        assert rw.field_write_block_reason(name, {"type": "char"}, model="mail.template", creating=True) is None
+        assert "only when the record is created" in rw.field_write_block_reason(name, {"type": "char"}, model="mail.template")
+    for name in ("email_from", "attachment_ids", "report_template_ids", "lang", "auto_delete", "mail_server_id"):
+        for creating in (False, True):  # no sender, no attachments, no reports, ever
+            reason = rw.field_write_block_reason(name, {"type": "char"}, model="mail.template", creating=creating)
+            assert reason and "only these fields" in reason, name
+    # a template made inside another record would skip the check of which records it is for
+    assert "create one on its own" in rw.nested_write_block_reason(
+        "base.automation", "template_id", "mail.template", creating=True
+    )
+
+
+@pytest.mark.parametrize("model", ["sale.order", "crm.lead", "res.partner", "account.move"])
+def test_new_templates_may_be_made_for_business_records(rw, model):
+    assert rw.template_model_block_reason(model) is None
+
+
+@pytest.mark.parametrize("model", ["res.users", "mail.template", "mail.message", "account.tax", "ir.cron", None, ""])
+def test_new_templates_are_never_made_for_setup_security_or_e_mail_models(rw, model):
+    assert rw.template_model_block_reason(model)
 
 
 @pytest.mark.parametrize("model", ["mail.alias", "mail.alias.domain", "mail.template.reset", "mail.template.preview"])

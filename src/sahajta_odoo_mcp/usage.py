@@ -26,7 +26,7 @@ RETENTION_DAYS = 30
 MAX_EVENTS = 50_000
 _QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
 _CHANGE_TOOLS = {"odoo_create": "created", "odoo_update": "updated", "odoo_run_action": "buttons", "odoo_add_note": "notes",
-                 "odoo_send_message": "messages"}
+                 "odoo_send_message": "messages", "odoo_change_followers": "followers"}
 
 
 def sanitize_detail(detail: str | None) -> str | None:

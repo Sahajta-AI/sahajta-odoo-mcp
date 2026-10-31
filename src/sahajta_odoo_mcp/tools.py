@@ -13,7 +13,7 @@ from typing import Annotated, Any
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import ContentBlock, ImageContent, TextContent, ToolAnnotations
 from pydantic import Field
 
 from . import guide
@@ -129,6 +129,9 @@ Changes = Annotated[
         description="Instead of ids + values: several changes with different values, approved together, e.g. "
         "[{\"ids\": [7], \"values\": {\"partner_id\": 3}}, {\"ids\": [8], \"values\": {\"partner_id\": 5}}]."
     ),
+]
+PartnerIds = Annotated[
+    list[int] | None, Field(description="Contact ids (res.partner) taken from search results. Never invent ids.")
 ]
 DialogValues = Annotated[
     dict[str, Any] | None,
@@ -276,6 +279,28 @@ def register_tools(
         when they are visible, and whether this server lets the AI press them."""
         return await run(lambda s: s.list_actions(model), model=model)
 
+    # A read tool, so it sits with the others: it must work in read-only mode too.
+    @mcp.tool(title="Read a file in Odoo", annotations=ToolAnnotations(title="Read a file in Odoo", **_READ), structured_output=False)
+    async def odoo_read_file(
+        attachment_id: Annotated[int, Field(description="Id of the file (ir.attachment), e.g. from odoo_search on ir.attachment with res_model/res_id of the record.")],
+        max_pages: Annotated[int | None, Field(description="For a PDF: how many pages to read from the start (default 20, at most 100).")] = None,
+    ) -> list[ContentBlock]:
+        """Read a file that is already in Odoo (e.g. a bill's PDF, a signed contract, a photo), with the person's Odoo
+        access rights: a PDF's text page by page, or a PNG/JPEG/WebP image itself. Also gives the file's name, type,
+        size and the record it is on, with a link. Scanned PDFs have no text: the answer says so."""
+        image: dict = {}
+
+        async def read(service: OdooService) -> dict:
+            result = await service.read_file(attachment_id, max_pages)
+            image.update(result.pop("image", None) or {})
+            return result
+
+        text = await run(read, model="ir.attachment")
+        blocks: list[ContentBlock] = [TextContent(type="text", text=text)]
+        if image:
+            blocks.append(ImageContent(type="image", data=image["data"], mime_type=image["mime_type"]))
+        return blocks
+
     if not settings.read_write:
         return
 
@@ -343,6 +368,26 @@ def register_tools(
     ) -> str:
         """Log an internal note in a record's chatter (like 'Log note' in Odoo)."""
         return await run(lambda s: s.add_note(model, record_id, note), model=model)
+
+    @mcp.tool(title="Preview changing followers", annotations=preview("Preview changing followers"), structured_output=False)
+    async def odoo_preview_followers(
+        model: Model, ids: Ids, add_partner_ids: PartnerIds = None, remove_partner_ids: PartnerIds = None
+    ) -> str:
+        """Show who would be added to or removed from the followers of these records, WITHOUT changing anything.
+        Followers get e-mails about the record (new messages and updates); adding them needs e-mailing switched on,
+        removing does not. Returns a confirm_token for odoo_change_followers."""
+        return await run(lambda s: s.preview_followers(model, ids, add_partner_ids, remove_partner_ids), model=model)
+
+    @mcp.tool(title="Change followers", annotations=change("Change followers"), structured_output=False)
+    async def odoo_change_followers(
+        model: Model, ids: Ids, add_partner_ids: PartnerIds = None, remove_partner_ids: PartnerIds = None,
+        confirm_token: ConfirmToken = None,
+    ) -> str:
+        """Add or remove followers, after the person approved the odoo_preview_followers result. Pass exactly the
+        previewed arguments plus its confirm_token. Returns each record's followers as Odoo now has them."""
+        return await run(
+            lambda s: s.change_followers(model, ids, add_partner_ids, remove_partner_ids, confirm_token), model=model
+        )
 
     if not settings.mcp_allow_outbound_messages:
         return

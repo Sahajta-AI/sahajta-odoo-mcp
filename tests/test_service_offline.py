@@ -821,6 +821,29 @@ async def test_a_setting_is_changed_by_a_new_settings_record_then_save(setup_fak
         await svc.preview_update("res.config.settings", [settings_id], {"quotation_validity_days": 30}, None)
 
 
+async def test_a_new_e_mail_template_is_made_only_for_business_records(setup_fake):
+    svc = make_service(setup_fake)
+    setup_fake.records["ir.model"][95] = {"model": "account.tax", "name": "Tax"}
+    values = [{"name": "Follow-up", "model_id": 94, "subject": "Following up on {{ object.name }}", "body_html": "<p>Hi</p>"}]
+    preview = await svc.preview_create("mail.template", values, None)
+    assert "sends nothing by itself" in " ".join(preview["warnings"])
+    created = await svc.create("mail.template", values, None, preview["confirm_token"])
+    assert setup_fake.records["mail.template"][created["created"][0]["id"]]["model_id"] == 94
+    for model_id in (92, 93, 95):  # res.users (security), mail.template (e-mail setup), account.tax (accounting setup)
+        with pytest.raises(PolicyViolation, match="only for business records Claude may change"):
+            await svc.preview_create("mail.template", [{**values[0], "model_id": model_id}], None)
+    with pytest.raises(ValidationFailed, match="name is required"):
+        await svc.preview_create("mail.template", [{"model_id": 94, "subject": "x"}], None)
+    with pytest.raises(ValidationFailed, match="model_id is required"):
+        await svc.preview_create("mail.template", [{"name": "x", "subject": "x"}], None)
+    for name, value in (("email_from", "ceo@elsewhere.example"), ("attachment_ids", [[6, 0, [1]]]), ("mail_server_id", 1)):
+        with pytest.raises(ValidationFailed, match="only these fields"):  # no sender, attachments or mail server
+            await svc.preview_create("mail.template", [{**values[0], name: value}], None)
+    with pytest.raises(ValidationFailed, match="only when the record is created"):  # never moved to another model
+        await svc.preview_update("mail.template", [20], {"model_id": 91}, None)
+    assert changes(setup_fake) == ["mail.template.create"]
+
+
 async def test_accounting_setup_changes_are_refused_before_anything_is_sent(setup_fake):
     svc = make_service(setup_fake, mcp_require_preview=False, mcp_allow_archive=True)
     with pytest.raises(PolicyViolation, match="past reports and GST returns"):

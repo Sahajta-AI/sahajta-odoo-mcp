@@ -8,9 +8,9 @@ Two layers:
     no cancelling, no outbound e-mail/SMS).
 
 A few setup areas are open within limits (see "Setup areas" below): app settings, e-mail
-template texts, automation rules without code, new accounting setup, bank matching rules, and moving
-files onto accounting entries. Every change
-there still goes through preview and approval.
+templates (their texts, and new ones), automation rules without code, new accounting setup, bank matching
+rules, and copying or moving files already in Odoo onto business records. Every change there still goes
+through preview and approval.
 
 Odoo's own access rights still apply on top of all of this: the server can never
 do more than the signed-in Odoo user is allowed to do in the Odoo UI.
@@ -187,7 +187,7 @@ OUTBOUND_GATED_PREFIXES: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 
 SETTINGS_MODEL = "res.config.settings"  # create a settings record, then press its Save button (execute)
-TEMPLATE_MODEL = "mail.template"  # existing templates: subject, body and recipients only
+TEMPLATE_MODEL = "mail.template"  # subject, body and recipients; a new one also gets a name and a business model
 AUTOMATION_MODEL = "base.automation"  # rules without code; their actions only nested inside them
 SERVER_ACTION_MODEL = "ir.actions.server"
 
@@ -199,11 +199,16 @@ CREATE_ONLY_MODELS: frozenset[str] = frozenset(
 # Bank matching rules may also be edited and archived: they only decide how future bank lines are matched,
 # never past entries. Their buttons stay closed.
 RECONCILE_MODEL = "account.reconcile.model"
-# Files (e.g. a bill's PDF) can be moved onto an accounting entry: only which record they are on changes, never
-# their content, and nothing is uploaded or deleted. Where they may come from is checked against Odoo by the
-# service (a draft entry, or no record at all).
+# Files already in Odoo (e.g. a bill's PDF, a contract signed in Odoo Sign) can be moved or copied onto business
+# records: only which record they are on changes, or Odoo duplicates the file itself. Their content never passes
+# through Claude, and nothing is uploaded or deleted. Where they come from is checked against Odoo by the service.
 ATTACHMENT_MODEL = "ir.attachment"
-ATTACHMENT_TARGETS: frozenset[str] = frozenset({"account.move"})
+# A file may be moved onto an accounting entry or a CRM lead ...
+ATTACHMENT_TARGETS: frozenset[str] = frozenset({"account.move", "crm.lead"})
+# ... from no record, a draft entry (the service checks the state) or a CRM lead (e.g. one Odoo's CRM inbox made).
+ATTACHMENT_SOURCES: frozenset[str] = frozenset({"account.move", "crm.lead"})
+# A copy may go onto a lead, a bill/invoice/entry, a quotation/order or a contact, from any file the person may read.
+ATTACHMENT_COPY_TARGETS: frozenset[str] = frozenset({"crm.lead", "account.move", "sale.order", "res.partner"})
 _SETUP_NAMES: dict[str, str] = {
     "account.account": "Accounts",
     "account.tax": "Taxes",
@@ -232,7 +237,10 @@ _LINE_PARENTS: dict[str, tuple[str, str]] = {line: parent for parent, line in NE
 # On these models only the listed fields may be written; all others stay read-only.
 FIELD_ALLOWLISTS: dict[str, frozenset[str]] = {
     ATTACHMENT_MODEL: frozenset({"res_model", "res_id"}),
-    TEMPLATE_MODEL: frozenset({"subject", "body_html", "email_to", "email_cc", "partner_to", "use_default_to", "reply_to"}),
+    # name and model_id only when a template is created (CREATE_ONLY_FIELDS); never a sender, attachments or reports
+    TEMPLATE_MODEL: frozenset(
+        {"subject", "body_html", "email_to", "email_cc", "partner_to", "use_default_to", "reply_to", "name", "model_id"}
+    ),
     AUTOMATION_MODEL: frozenset(
         {
             "name", "description", "model_id", "trigger", "trigger_field_ids", "trg_selection_field_id",
@@ -272,11 +280,11 @@ LIMITED_BUTTONS: dict[str, frozenset[str]] = {
 }
 _BUTTONS_REFUSED: dict[str, str] = {
     ATTACHMENT_MODEL: "Buttons on files cannot be pressed through Claude. Claude can only move a file onto a bill, "
-    "invoice or journal entry.",
+    "invoice, journal entry or lead, or copy it onto a lead, bill, quotation or contact.",
     SETTINGS_MODEL: "Only the settings screen's Save button (execute) can be pressed through Claude; the other "
     "settings buttons open or install things. Use them in Odoo.",
     TEMPLATE_MODEL: "Buttons on e-mail templates cannot be pressed through Claude. Claude can only change a "
-    "template's subject, body and recipients.",
+    "template's subject, body and recipients, or create a new template.",
     AUTOMATION_MODEL: "Buttons on automation rules cannot be pressed through Claude. To stop a rule, archive it "
     "(set active to false).",
 }
@@ -341,9 +349,13 @@ WORKFLOW_FIELDS: frozenset[str] = frozenset({"state", "move_type", "payment_stat
 # (model, field) pairs that pick what a new record is (customer invoice, vendor bill, credit note, ...).
 # Odoo marks them read-only because its own screens set them on create (the record always starts in
 # draft); they may be set on create here too, but never changed afterwards. An automation rule's model is
-# fixed too: changing it would detach its actions.
+# fixed too: changing it would detach its actions. So are an e-mail template's model and name, which other
+# records and rules rely on.
 CREATE_ONLY_FIELDS: frozenset[tuple[str, str]] = frozenset(
-    {("account.move", "move_type"), (AUTOMATION_MODEL, "model_id"), (SERVER_ACTION_MODEL, "model_id")}
+    {
+        ("account.move", "move_type"), (AUTOMATION_MODEL, "model_id"), (SERVER_ACTION_MODEL, "model_id"),
+        (TEMPLATE_MODEL, "model_id"), (TEMPLATE_MODEL, "name"),
+    }
 )
 
 # Field types the AI can never write: files, and free-form JSON whose changes a preview can't show clearly.
@@ -588,12 +600,8 @@ class SafetyPolicy:
             if model == ATTACHMENT_MODEL:
                 return (
                     "Files cannot be uploaded through Claude. Upload them in Odoo, or forward a bill's PDF to the bill "
-                    "inbox (it becomes a draft bill); Claude can then move a file onto the right bill or entry."
-                )
-            if model == TEMPLATE_MODEL:
-                return (
-                    "New e-mail templates cannot be created through Claude. Claude can change the subject, body and "
-                    "recipients of an existing template; create new templates in Odoo."
+                    "inbox (it becomes a draft bill); Claude can then move a file onto the right bill or entry. A file "
+                    'already in Odoo can be copied: records [{"copy_from": <file id>, "res_model": ..., "res_id": ...}].'
                 )
             return None
         if model in CREATE_ONLY_MODELS:
@@ -622,6 +630,11 @@ class SafetyPolicy:
         if comodel in _LINE_PARENTS:
             owner, owner_field = _LINE_PARENTS[comodel]
             return f"{comodel} records can be written only inside their {owner} record (field {owner_field})"
+        if creating and comodel == TEMPLATE_MODEL:  # its model is checked only for a template created on its own
+            return (
+                "New e-mail templates cannot be created inside another record; create one on its own "
+                f"(odoo_preview_create on {TEMPLATE_MODEL})"
+            )
         return self.model_write_block_reason(comodel) or self.change_block_reason(
             comodel, "create" if creating else "write"
         )
@@ -762,6 +775,20 @@ class SafetyPolicy:
             )
         return "Deleting is not possible through Claude. Delete it in Odoo."
 
+    # -- e-mail templates ---------------------------------------------------------------
+
+    def template_model_block_reason(self, model: object) -> str | None:
+        """Why a new e-mail template may not be made for records of model: only business records Claude may
+        change, never setup, security or e-mail models."""
+        if not isinstance(model, str) or not model:
+            return "a new e-mail template must say which kind of record it is for (model_id: the id of its ir.model)"
+        reason = self.model_write_block_reason(model)
+        if reason is None and (model in LIMITED_MODELS or protected_area(model) or model.startswith("mail.")):
+            reason = f"'{model}' is setup, security or e-mail configuration, not business records"
+        if reason:
+            return f"a new e-mail template can be made only for business records Claude may change: {reason}"
+        return None
+
     # -- automation rules ---------------------------------------------------------------
 
     def automation_trigger_block_reason(self, trigger: object) -> str | None:
@@ -823,6 +850,8 @@ class SafetyPolicy:
         """
         names = sorted({str(name) for name in field_names or ()})
         if model == ATTACHMENT_MODEL:
+            if mode == "create":
+                return ["Odoo makes a copy of each file on the new record; the original stays where it is."]
             return ["Each file leaves the record it is on now. It can be moved back the same way; nothing is deleted."]
         if model == RECONCILE_MODEL:
             warnings = [
@@ -840,7 +869,12 @@ class SafetyPolicy:
             if groups:
                 return [f"Switches a feature on or off for every user in the company, not just you: {', '.join(groups)}."]
             return []
-        if model == TEMPLATE_MODEL and mode != "create":
+        if model == TEMPLATE_MODEL:
+            if mode == "create":
+                return [
+                    "A new template sends nothing by itself. From now on, people (and automation rules) can choose it "
+                    "when they send e-mails about these records."
+                ]
             return ["Changes every e-mail Odoo sends with this template from now on, to every recipient."]
         if model == AUTOMATION_MODEL:
             if mode != "create" and names == ["active"]:

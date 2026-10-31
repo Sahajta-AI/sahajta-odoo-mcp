@@ -19,6 +19,7 @@ dependencies = [
     "starlette>=0.46",
     "python-multipart>=0.0.20",
     "redis>=5.2",
+    "pypdf>=6,<7",  # odoo_read_file: a PDF's text (pure Python, no other dependencies)
 ]
 
 [project.optional-dependencies]
