@@ -15,6 +15,10 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 # Hard ceilings that no environment variable can raise.
 HARD_MAX_READ_RECORDS = 1000
 HARD_MAX_WRITE_RECORDS = 100
+HARD_MAX_ACTION_RECORDS = 100
+# How long a person's approval of a previewed change stays usable (the staleness check applies on top).
+DEFAULT_CONFIRM_TTL_SECONDS = 3600
+HARD_MAX_CONFIRM_TTL_SECONDS = 24 * 3600
 
 DEFAULT_REDIRECT_URIS = [
     "https://claude.ai/api/mcp/auth_callback",
@@ -58,7 +62,13 @@ class Settings(BaseSettings):
     )
     mcp_default_read_limit: int = Field(default=50, ge=1)
     mcp_max_read_records: int = Field(default=200, ge=1)
-    mcp_max_write_records: int = Field(default=20, ge=1)
+    # creating and editing records, and moving files
+    mcp_max_write_records: int = Field(default=100, ge=1)
+    # buttons, dialogs, sending messages, followers and deleting: each acts on whole records at once
+    mcp_max_action_records: int = Field(default=20, ge=1)
+    mcp_confirm_ttl_seconds: int = Field(
+        default=DEFAULT_CONFIRM_TTL_SECONDS, ge=60, description="How long an approved preview stays usable."
+    )
     mcp_max_text_chars: int = Field(default=4000, ge=200)
     mcp_max_response_chars: int = Field(default=120_000, ge=10_000)
     mcp_blocked_models: CsvList = Field(default_factory=list, description="Extra models to block entirely.")
@@ -141,6 +151,8 @@ class Settings(BaseSettings):
     def _clamp(self) -> Settings:
         self.mcp_max_read_records = min(self.mcp_max_read_records, HARD_MAX_READ_RECORDS)
         self.mcp_max_write_records = min(self.mcp_max_write_records, HARD_MAX_WRITE_RECORDS)
+        self.mcp_max_action_records = min(self.mcp_max_action_records, HARD_MAX_ACTION_RECORDS)
+        self.mcp_confirm_ttl_seconds = min(self.mcp_confirm_ttl_seconds, HARD_MAX_CONFIRM_TTL_SECONDS)
         self.mcp_default_read_limit = min(self.mcp_default_read_limit, self.mcp_max_read_records)
         return self
 

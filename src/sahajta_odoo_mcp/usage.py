@@ -26,7 +26,8 @@ RETENTION_DAYS = 30
 MAX_EVENTS = 50_000
 _QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
 _CHANGE_TOOLS = {"odoo_create": "created", "odoo_update": "updated", "odoo_run_action": "buttons", "odoo_add_note": "notes",
-                 "odoo_send_message": "messages", "odoo_change_followers": "followers"}
+                 "odoo_send_message": "messages", "odoo_change_followers": "followers", "odoo_delete": "deleted"}
+_PER_RECORD = ("odoo_update", "odoo_delete")  # counted per record, the others per call
 
 
 def sanitize_detail(detail: str | None) -> str | None:
@@ -93,7 +94,7 @@ class UsageLog:
                 by_day[day][e.get("outcome", "error")] += 1
             by_tool[e.get("tool", "?")][e.get("outcome", "?")] += 1
             if e.get("outcome") == "ok" and e.get("tool") in _CHANGE_TOOLS:
-                changes[_CHANGE_TOOLS[e["tool"]]] += e.get("records", 1) if e["tool"] == "odoo_update" else 1
+                changes[_CHANGE_TOOLS[e["tool"]]] += (e.get("records") or 1) if e["tool"] in _PER_RECORD else 1
         problems = [e for e in events if e.get("outcome") != "ok"][-25:]
         return {
             "period_days": days,

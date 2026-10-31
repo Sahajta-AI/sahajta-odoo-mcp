@@ -8,9 +8,13 @@ Two layers:
     no cancelling, no outbound e-mail/SMS).
 
 A few setup areas are open within limits (see "Setup areas" below): app settings, e-mail
-templates (their texts, and new ones), automation rules without code, new accounting setup, bank matching
-rules, and copying or moving files already in Odoo onto business records. Every change there still goes
-through preview and approval.
+templates (their texts, and new ones), automation rules without code, new accounting setup and a few edits
+to existing setup, bank matching rules, and copying or moving files already in Odoo onto business records.
+Every change there still goes through preview and approval.
+
+Deleting has one narrow path (see DELETABLE): drafts that never had a number, cancelled quotations
+and archived leads, through the delete tools only. Removing lines is open only on documents that are
+still drafts (see LINE_REMOVAL).
 
 Odoo's own access rights still apply on top of all of this: the server can never
 do more than the signed-in Odoo user is allowed to do in the Odoo UI.
@@ -191,11 +195,30 @@ TEMPLATE_MODEL = "mail.template"  # subject, body and recipients; a new one also
 AUTOMATION_MODEL = "base.automation"  # rules without code; their actions only nested inside them
 SERVER_ACTION_MODEL = "ir.actions.server"
 
-# Accounting setup: new records may be created; existing ones are never changed or archived through Claude,
-# because entries already use them.
-CREATE_ONLY_MODELS: frozenset[str] = frozenset(
+# Accounting setup: new records may be created (with the usual field rules). Records already in Odoo get only the
+# edits in SETUP_EDIT_FIELDS: entries already use them, so a rate, an account type or a journal's code would change
+# past reports and GST returns. What may be set on creation is not limited by that list.
+ACCOUNTING_SETUP_MODELS: frozenset[str] = frozenset(
     {"account.account", "account.tax", "account.fiscal.position", "account.journal"}
 )
+SETUP_EDIT_FIELDS: dict[str, frozenset[str]] = {
+    # name; tags place the account in the cash flow report; archiving only an account without journal items (the
+    # service asks Odoo first)
+    "account.account": frozenset({"name", "tag_ids", "active"}),
+    # on/off and its texts. fiscal_position_ids / original_tax_ids are the fiscal position tax mapping, which Odoo 19
+    # keeps on the replacement tax ("Fiscal Positions" and "Replaces" on its form)
+    "account.tax": frozenset(
+        {"active", "name", "description", "invoice_label", "fiscal_position_ids", "original_tax_ids"}
+    ),
+    # name, when it applies on its own, and its mappings: tax_ids (Odoo 19: its replacement taxes; Odoo 18: mapping
+    # lines) and account_ids (account mapping lines)
+    "account.fiscal.position": frozenset(
+        {"name", "auto_apply", "country_id", "country_group_id", "state_ids", "zip_from", "zip_to", "vat_required",
+         "tax_ids", "account_ids"}
+    ),
+    # how it is shown: name, dashboard, colour and display order
+    "account.journal": frozenset({"name", "show_on_dashboard", "color", "sequence"}),
+}
 # Bank matching rules may also be edited and archived: they only decide how future bank lines are matched,
 # never past entries. Their buttons stay closed.
 RECONCILE_MODEL = "account.reconcile.model"
@@ -218,7 +241,7 @@ _SETUP_NAMES: dict[str, str] = {
 }
 
 # Models these rules open, although their prefix is protected or they were blocked before.
-LIMITED_MODELS: frozenset[str] = CREATE_ONLY_MODELS | {
+LIMITED_MODELS: frozenset[str] = ACCOUNTING_SETUP_MODELS | {
     SETTINGS_MODEL, TEMPLATE_MODEL, AUTOMATION_MODEL, RECONCILE_MODEL, ATTACHMENT_MODEL,
 }
 
@@ -276,7 +299,7 @@ LIMITED_BUTTONS: dict[str, frozenset[str]] = {
     SETTINGS_MODEL: frozenset({"execute"}),  # the settings screen's Save (drawn by Odoo's web client, not the view)
     TEMPLATE_MODEL: frozenset(),
     AUTOMATION_MODEL: frozenset(),
-    **{model: frozenset() for model in CREATE_ONLY_MODELS | {RECONCILE_MODEL, ATTACHMENT_MODEL}},
+    **{model: frozenset() for model in ACCOUNTING_SETUP_MODELS | {RECONCILE_MODEL, ATTACHMENT_MODEL}},
 }
 _BUTTONS_REFUSED: dict[str, str] = {
     ATTACHMENT_MODEL: "Buttons on files cannot be pressed through Claude. Claude can only move a file onto a bill, "
@@ -288,6 +311,35 @@ _BUTTONS_REFUSED: dict[str, str] = {
     AUTOMATION_MODEL: "Buttons on automation rules cannot be pressed through Claude. To stop a rule, archive it "
     "(set active to false).",
 }
+
+# Lines that may be removed (Odoo's command 2 deletes the line): only from these fields, and only while the document
+# is in one of these states. The service asks Odoo for the state before the approval and again at the change.
+# Every other one2many field keeps the general rule: lines are added or edited, never removed.
+LINE_REMOVAL: dict[tuple[str, str], frozenset[str]] = {
+    ("sale.order", "order_line"): frozenset({"draft", "sent"}),  # quotations
+    ("purchase.order", "order_line"): frozenset({"draft", "sent"}),  # requests for quotation
+    ("account.move", "invoice_line_ids"): frozenset({"draft"}),  # draft invoices, bills and entries
+}
+_LINE_REMOVAL_REFUSED: dict[str, str] = {
+    "sale.order": "is a confirmed or cancelled order, not a quotation, so removing lines is not possible (Odoo keeps "
+    "them to track what is delivered and invoiced). Set the line's quantity to 0 instead",
+    "purchase.order": "is a confirmed or cancelled purchase order, not a request for quotation, so removing lines is "
+    "not possible. Set the line's quantity to 0 instead",
+    "account.move": "is not a draft (it is posted or cancelled), so removing lines is not possible. Reset it to draft "
+    "first and then remove the line, or set the line's quantity to 0 on a draft",
+}
+
+# The only records Claude may delete, through odoo_preview_delete / odoo_delete and nothing else. The service checks
+# each record with Odoo before the approval and again right before deleting (OdooService._deletable).
+DELETABLE: dict[str, str] = {
+    "account.move": "a draft invoice, bill or journal entry that never had a number",
+    "sale.order": "a cancelled quotation or sales order",
+    "crm.lead": "an archived lead or opportunity",
+}
+DELETABLE_TEXT = (
+    "draft invoices, bills or entries that never had a number, cancelled quotations or sales orders, and archived "
+    "leads"
+)
 
 # Settings fields that are refused (module_* is checked separately).
 _IDENTITY_FIELD_RE = re.compile(
@@ -604,11 +656,7 @@ class SafetyPolicy:
                     'already in Odoo can be copied: records [{"copy_from": <file id>, "res_model": ..., "res_id": ...}].'
                 )
             return None
-        if model in CREATE_ONLY_MODELS:
-            return (
-                f"{_SETUP_NAMES[model]} already in Odoo cannot be changed or archived through Claude: changing setup "
-                "that entries already use changes past reports and GST returns. Do it in Odoo."
-            )
+        # existing accounting setup: only the fields in SETUP_EDIT_FIELDS, checked per field
         if model == SETTINGS_MODEL:
             return (
                 "Settings are changed by creating a new settings record with only the values to change "
@@ -634,6 +682,11 @@ class SafetyPolicy:
             return (
                 "New e-mail templates cannot be created inside another record; create one on its own "
                 f"(odoo_preview_create on {TEMPLATE_MODEL})"
+            )
+        if comodel in ACCOUNTING_SETUP_MODELS and not creating:
+            return (
+                f"{_SETUP_NAMES[comodel]} already in Odoo cannot be changed through another record; change them on "
+                f"their own (odoo_preview_update on {comodel}), where only some fields can change"
             )
         return self.model_write_block_reason(comodel) or self.change_block_reason(
             comodel, "create" if creating else "write"
@@ -679,6 +732,14 @@ class SafetyPolicy:
                 return f"points to a blocked model ({relation}): server actions can be added only inside an automation rule"
         if model == "account.journal" and "bank" in name:
             return _BANK_FIELD
+        setup_edits = SETUP_EDIT_FIELDS.get(model or "")
+        if setup_edits is not None and not creating and name not in setup_edits:
+            kind = _SETUP_NAMES[model].lower()
+            return (
+                f"cannot be changed through Claude on {kind} already in Odoo: entries already use them, so the change "
+                f"would alter past reports and GST returns. A person can do it in Odoo. On existing {kind} Claude can "
+                f"change only: {', '.join(sorted(setup_edits))}"
+            )
         if model == SETTINGS_MODEL:
             reason = _settings_field_block_reason(name)
             if reason:
@@ -768,12 +829,42 @@ class SafetyPolicy:
         return f"Archiving is switched off for Claude. {self._elsewhere}"
 
     def _delete_reason(self) -> str:
+        only = f"Claude can delete only {DELETABLE_TEXT}, with odoo_preview_delete."
         if self.settings.mcp_allow_archive:
             return (
-                "Deleting is not possible through Claude. Archive the record instead (set active to false with "
-                "odoo_preview_update), or delete it in Odoo."
+                f"Deleting is not possible through Claude's buttons. {only} Archive the record instead (set active to "
+                "false with odoo_preview_update), or delete it in Odoo."
             )
-        return "Deleting is not possible through Claude. Delete it in Odoo."
+        return f"Deleting is not possible through Claude's buttons. {only} Delete anything else in Odoo."
+
+    # -- deleting and removing lines ------------------------------------------------------
+
+    def delete_block_reason(self, model: str) -> str | None:
+        """Why records of model may never be deleted (before any record is looked at), or None."""
+        reason = self.model_write_block_reason(model)
+        if reason:
+            return reason
+        if model not in DELETABLE:
+            return (
+                f"Deleting {model} records is not possible through Claude. Claude can delete only {DELETABLE_TEXT}. "
+                "Archive or cancel instead where that is allowed, or delete it in Odoo."
+            )
+        return None
+
+    def check_delete(self, model: str) -> None:
+        reason = self.delete_block_reason(model)
+        if reason:
+            raise PolicyViolation(reason)
+
+    @staticmethod
+    def line_removal_states(model: str, field: str) -> frozenset[str] | None:
+        """The document states in which lines may be removed from model.field; None when they never may."""
+        return LINE_REMOVAL.get((model, field))
+
+    @staticmethod
+    def line_removal_refusal(model: str, name: str) -> str:
+        """Why no line can be removed from this document (shown as name) in its current state."""
+        return f"'{name}' {_LINE_REMOVAL_REFUSED.get(model, 'is not a draft, so removing lines is not possible')}"
 
     # -- e-mail templates ---------------------------------------------------------------
 
@@ -883,11 +974,13 @@ class SafetyPolicy:
                     "matching record, without asking anyone."
                 ]
             return ["This rule runs automatically from now on, on every matching record, without asking anyone first."]
-        if model in CREATE_ONLY_MODELS and mode == "create":
+        if model in ACCOUNTING_SETUP_MODELS and mode == "create":
             return [
-                "New accounting setup affects every future entry, and it cannot be changed through Claude afterwards. "
-                "Check the tax setup with your CA before approving."
+                "New accounting setup affects every future entry; afterwards Claude can change only a few things on it "
+                "(such as its name). Check the tax setup with your CA before approving."
             ]
+        if model in ACCOUNTING_SETUP_MODELS:
+            return _setup_edit_warnings(model, names, values)
         return []
 
     # -- context ------------------------------------------------------------------------------
@@ -907,6 +1000,12 @@ class SafetyPolicy:
                     # wizards change the records they are opened on, so those must be changeable
                     self.check_write(str(value))
                     self.check_change(str(value), "write")
+                    if value in ACCOUNTING_SETUP_MODELS:
+                        raise PolicyViolation(
+                            f"dialogs cannot act on {_SETUP_NAMES[value].lower()} already in Odoo: a dialog could "
+                            "change setup that entries already use, which changes past reports and GST returns. "
+                            "Do it in Odoo"
+                        )
                 elif key in ("lang", "tz") and not (isinstance(value, str) and len(value) <= 64):
                     raise PolicyViolation(f"context {key} must be a short text value")
                 elif key in ("active_id",) and not _is_int(value):
@@ -915,10 +1014,11 @@ class SafetyPolicy:
                     isinstance(value, list) and all(_is_int(v) for v in value)
                 ):
                     raise PolicyViolation(f"context {key} must be a list of integer ids")
-                if key == "active_ids" and len(value) > self.settings.mcp_max_write_records:
+                if key == "active_ids" and len(value) > self.settings.mcp_max_action_records:
+                    # a dialog acts on the records it is opened on, like a button
                     raise PolicyViolation(
                         f"context active_ids lists {len(value)} records; the limit per change is "
-                        f"{self.settings.mcp_max_write_records}"
+                        f"{self.settings.mcp_max_action_records}"
                     )
                 clean[key] = value
             elif low.startswith("default_"):
@@ -944,6 +1044,61 @@ _SETUP_BUTTONS_REFUSED = (
     "Buttons on accounting setup cannot be pressed through Claude: they change setup that entries already use. "
     "Do it in Odoo."
 )
+
+
+# Odoo 19 keeps the tax mapping on the taxes: a tax linked to fiscal positions is a replacement tax, offered on new
+# documents only under those fiscal positions (account.tax._compute_is_domestic and its search domain).
+_TAX_OFFERED = (
+    "A tax linked to a fiscal position is offered on new documents only under that fiscal position; a tax linked to "
+    "none is offered on all new documents. Check that the usual taxes stay available."
+)
+
+
+def _setup_edit_warnings(model: str, names: list[str], values: Iterable[dict] | None) -> list[str]:
+    """What an edit to accounting setup already in Odoo affects, in plain words."""
+    actives = {v.get("active") for v in values or () if isinstance(v, dict) and "active" in v}
+    changed = set(names)
+    warnings: list[str] = []
+    if model == "account.account":
+        if "name" in changed:
+            warnings.append("The new name shows wherever the account appears, also in reports for past periods. "
+                            "Amounts and entries do not change.")
+        if "tag_ids" in changed:
+            warnings.append("Tags decide where the account's amounts appear in reports that use tags, such as the cash "
+                            "flow statement, also for past periods. Entries do not change.")
+        if False in actives:
+            warnings.append("Archiving hides the account from new entries. Odoo shows no journal items on it (checked "
+                            "just now); it can be unarchived later.")
+        if True in actives:
+            warnings.append("Unarchiving lets people choose the account on new entries again.")
+    elif model == "account.tax":
+        if False in actives:
+            warnings.append("Switching the tax off hides it on new invoices, bills and orders: products and fiscal "
+                            "positions that have it stop adding it to new lines. Documents already made keep it, and "
+                            "past reports and GST returns do not change. It can be switched on again.")
+        if True in actives:
+            warnings.append("Switching the tax on lets new invoices, bills and orders use it again, also through the "
+                            "products and fiscal positions that have it.")
+        if changed & {"fiscal_position_ids", "original_tax_ids"}:
+            warnings.append("Changes which tax replaces which under a fiscal position. This applies only to new "
+                            "documents and new lines; documents already made keep their taxes.")
+        if "fiscal_position_ids" in changed:
+            warnings.append(_TAX_OFFERED)
+        if changed & {"name", "description", "invoice_label"}:
+            warnings.append("The new text shows on documents from now on, and wherever Odoo shows the tax. The rate and "
+                            "amounts do not change.")
+    elif model == "account.fiscal.position":
+        warnings.append("Fiscal position changes apply only to new documents, or when a person chooses the fiscal "
+                        "position again on a draft. Invoices, bills and orders already made keep their taxes and "
+                        "accounts, and past reports do not change.")
+        if "tax_ids" in changed:
+            warnings.append(_TAX_OFFERED)
+    elif model == "account.journal":
+        warnings.append("Changes only how the journal is shown (name, dashboard, colour, order). Its entries and their "
+                        "numbers do not change.")
+    return warnings
+
+
 _BANK_FIELD = (
     "holds bank details, which Claude never sets: a wrong bank account sends money to the wrong place. "
     "A person sets it in Odoo"

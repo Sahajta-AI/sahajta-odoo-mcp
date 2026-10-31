@@ -3,10 +3,12 @@
 This is the only module that sends data-changing calls to Odoo, and it only ever
 sends: create, write (web_save_multi for several records with their own values), a UI
 button method, message_post, copy of a file (ir.attachment, so Odoo duplicates its content),
-or message_subscribe / message_unsubscribe (followers). There is no code path that calls
-unlink. Previews only read (onchange computes a new record in memory, as Odoo's own forms do;
-the e-mail composer's also makes the quotation PDF, see _DIALOG_BUTTONS); the buttons a preview
-presses are those listed in _DIALOG_BUTTONS with ask_odoo, as only checking and opening their dialog.
+or message_subscribe / message_unsubscribe (followers). Deleting has one path only:
+OdooService.delete, through OdooClient.delete_records, for the records policy.DELETABLE names
+(the client refuses unlink through every other call). Previews only read (onchange computes a
+new record in memory, as Odoo's own forms do; the e-mail composer's also makes the quotation PDF,
+see _DIALOG_BUTTONS); the buttons a preview presses are those listed in _DIALOG_BUTTONS with
+ask_odoo, as only checking and opening their dialog.
 """
 
 from __future__ import annotations
@@ -37,11 +39,13 @@ from .errors import NotSent, OdooError, OdooMCPError, PolicyViolation, Validatio
 from .formatting import UNTRUSTED_NOTE, Formatter, html_to_text
 from .odoo_client import OdooClient, OdooIdentity
 from .policy import (
+    ACCOUNTING_SETUP_MODELS,
     ATTACHMENT_COPY_TARGETS,
     ATTACHMENT_MODEL,
     ATTACHMENT_SOURCES,
     ATTACHMENT_TARGETS,
     CREATE_ONLY_FIELDS,
+    DELETABLE_TEXT,
     TEMPLATE_MODEL,
     SafetyPolicy,
     is_sensitive_field,
@@ -87,6 +91,14 @@ _FILLED_IN_FIELDS = (
 )
 _TOTAL_FIELDS = ("amount_untaxed", "amount_tax", "amount_total", "tax_totals")
 _SHOWN_TEXT = 1500  # characters of an e-mail body or note shown in a preview
+# Above this many records a preview shows one compact line per record, and Odoo's own computed values (onchange) for
+# the first ones only, so it stays readable and quick.
+_FULL_PREVIEW_RECORDS = 20
+# What a preview shows about a line that would be removed.
+_LINE_SHOWN = ("name", "product_id", "product_uom_qty", "product_qty", "quantity", "price_unit", "price_subtotal",
+               "currency_id")
+# What decides whether a record may be deleted (see _not_deletable).
+_DELETE_CHECK_FIELDS = ("state", "name", "posted_before", "active")
 _FACTS_SECONDS = 8.0  # longest a tool waits for the guide's facts from Odoo before using fixed wording
 _HELP_POINTER = (
     "odoo_help shows, for each area, what Claude can and cannot do here and the steps to do the rest in Odoo. "
@@ -367,6 +379,49 @@ def _next_step(model: str, row: dict) -> str | None:
         if state == "sale" and row.get("invoice_status") == "to invoice":
             return "Invoice it: odoo_preview_action with method dialog:sale.advance.payment.inv."
     return None
+
+
+def _not_deletable(model: str, row: dict, fields: dict) -> str | None:
+    """Why this record (as Odoo has it now) may not be deleted, or None. The whole rule; see policy.DELETABLE."""
+    if model == "account.move":
+        if row.get("state") != "draft":
+            return "is not a draft"
+        if row.get("name") not in (False, None, "", "/"):
+            return f"already had a number ({row['name']})"
+        if "posted_before" in fields and row.get("posted_before") is not False:
+            return "was posted before"
+        return None
+    if model == "sale.order":
+        return None if "state" in fields and row.get("state") == "cancel" else "is not cancelled"
+    if model == "crm.lead":
+        return None if "active" in fields and row.get("active") is False else "is not archived"
+    return "is not a kind of record Claude can delete"
+
+
+def _short(value: Any) -> str:
+    """A described value as a few words, for one-line previews."""
+    if value is None or value is False or value == []:
+        return "empty"
+    if isinstance(value, dict):
+        return str(value.get("name") or value.get("id") or json.dumps(value, ensure_ascii=False, default=str))
+    if isinstance(value, list):
+        return ", ".join(_short(v) for v in value) or "empty"
+    return str(value)
+
+
+def _one_line(described: dict) -> str:
+    return "; ".join(f"{label}: {_short(value)}" for label, value in described.items())
+
+
+def _linked_ids(commands: Any) -> set[int]:
+    """Ids a many2many change links (commands 4 and 6, as normalised)."""
+    ids: set[int] = set()
+    for command in commands or []:
+        if isinstance(command, list) and command and command[0] == 4:
+            ids.add(command[1])
+        elif isinstance(command, list) and command and command[0] == 6:
+            ids.update(command[2])
+    return ids
 
 
 @dataclass
@@ -699,6 +754,8 @@ class OdooService:
 
     async def _describe_commands(self, meta: dict, commands: list) -> list:
         comodel = meta["relation"]
+        removed = [command[1] for command in commands if command[0] == 2]
+        lines = await self._describe_lines(comodel, removed) if removed else {}
         described = []
         for command in commands:
             code = command[0]
@@ -706,6 +763,8 @@ class OdooService:
                 described.append({"add new line": await self._describe_values(comodel, command[2])})
             elif code == 1:
                 described.append({f"edit line {command[1]}": await self._describe_values(comodel, command[2])})
+            elif code == 2:  # removing a line deletes it: say which line and its amount
+                described.append({"remove line (deleted)": lines.get(command[1], {"id": command[1]})})
             elif code in (3, 4):
                 names = await self._names(comodel, {command[1]})
                 verb = "unlink (keep record)" if code == 3 else "link"
@@ -716,6 +775,30 @@ class OdooService:
                 names = await self._names(comodel, set(command[2]))
                 described.append({"set exactly": [{"id": i, "name": names.get(i, "?")} for i in command[2]]})
         return described
+
+    async def _describe_lines(self, model: str, line_ids: list[int]) -> dict[int, dict]:
+        """Document lines in plain words: description, product, quantity and amount, by id."""
+        fields = await self._fields(model)
+        wanted = [f for f in _LINE_SHOWN if f in fields]
+        rows = await self.client.call(model, "read", ids=line_ids, fields=wanted, context={"active_test": False})
+        lines: dict[int, dict] = {}
+        for row in rows or []:
+            currency = _name_of(row.get("currency_id"))
+            shown: dict[str, Any] = {"id": row["id"]}
+            if row.get("name"):
+                shown["line"] = self.fmt.truncate(str(row["name"]))
+            if _name_of(row.get("product_id")):
+                shown["product"] = _name_of(row["product_id"])
+            for name in ("product_uom_qty", "product_qty", "quantity"):
+                if isinstance(row.get(name), (int, float)) and not isinstance(row.get(name), bool):
+                    shown["quantity"] = row[name]
+                    break
+            if "price_unit" in row:
+                shown["unit_price"] = _money(row["price_unit"], currency)
+            if "price_subtotal" in row:
+                shown["amount"] = _money(row["price_subtotal"], currency)
+            lines[row["id"]] = shown
+        return lines
 
     async def _fingerprint(self, model: str, ids: list[int], fields: list[str]) -> dict:
         """Last-modified time plus the current values the person was shown, per record.
@@ -765,7 +848,7 @@ class OdooService:
             raise self._not_allowed(model, operation, ids)
 
     def _not_allowed(self, model: str, operation: str, ids: list[int] | None = None) -> OdooError:
-        what = {"create": "create", "write": "change"}.get(operation, operation)
+        what = {"create": "create", "write": "change", "unlink": "delete"}.get(operation, operation)
         which = f" {ids}" if ids else ""
         return OdooError(
             f"your Odoo user may not {what} {model} records{which} (Odoo's access rights for this user), so Odoo "
@@ -776,6 +859,16 @@ class OdooService:
 
     def _link(self, model: str, record_id: int) -> str:
         return f"{self.client.creds.url}/odoo/{model}/{record_id}"
+
+    def _fits_preview(self, result: dict) -> dict:
+        """A preview is shown whole or not at all: the person approves every record in it, so none may be cut off."""
+        size = len(json.dumps(result, ensure_ascii=False, default=str))
+        if size > self.settings.mcp_max_response_chars:
+            raise ValidationFailed(
+                f"this preview is too long to show in one answer ({size:,} characters), and the person must see every "
+                "record they approve. Preview the change in smaller parts"
+            )
+        return result
 
     async def _summaries(
         self, model: str, ids: list[int], extra: list[str] | tuple = (), *, check: bool = True, steps: bool = True
@@ -919,13 +1012,15 @@ class OdooService:
                 "odoo": {"url": self.client.creds.url, "version": self.identity.server_version, "protocol": self.identity.protocol},
                 "permissions": {
                     "mode": s.mcp_access_mode,
-                    "can_delete_records": False,
+                    "can_delete_records": f"only {DELETABLE_TEXT}" if s.read_write else False,
                     "changes_need_preview_and_confirmation": s.mcp_require_preview,
                     "can_archive": s.mcp_allow_archive,
                     "can_cancel_or_reset_documents": s.mcp_allow_cancel_actions,
                     "can_email_or_message_people": s.mcp_allow_outbound_messages,
                     "max_records_per_read": s.mcp_max_read_records,
                     "max_records_per_change": s.mcp_max_write_records,
+                    "max_records_per_button_message_or_delete": s.mcp_max_action_records,
+                    "approval_valid_for": self.shared.signer.valid_for,
                     "note": "Odoo's own access rights for this user also apply to everything.",
                 },
                 "bill_inbox": inboxes or (
@@ -1559,7 +1654,9 @@ class OdooService:
             await self._odoo_allows(model, "create")
             filled_in, totals, warnings, unknown = [], [], [], []
             for index, values in enumerate(normalized, 1):
-                seen = await self._new_record(model, values, ctx)
+                # Odoo's computed values for the first records only: one or two Odoo calls each, so a long list
+                # would not fit in one tool call. The rest are checked for required fields (one call for all).
+                seen = await self._new_record(model, values, ctx) if index <= _FULL_PREVIEW_RECORDS else None
                 if seen is None:  # this Odoo could not show it: fall back to its defaults alone
                     unknown.append((index, values))
                     continue
@@ -1574,22 +1671,30 @@ class OdooService:
             warnings.extend(self._change_warnings(
                 model, "create", sorted({name for values in normalized for name in values}), normalized
             ))
+            described = [await self._describe_values(model, values) for values in normalized]
+            compact = len(normalized) > _FULL_PREVIEW_RECORDS
             result: dict[str, Any] = {
                 "preview": f"Create {len(normalized)} new {model} record(s)",
-                "records": [await self._describe_values(model, values) for values in normalized],
+                # a long list: one line per record, so the person can read every one
+                "records": [f"{n}. {_one_line(d)}" for n, d in enumerate(described, 1)] if compact else described,
             }
             if any(filled_in):
-                result["filled_in_by_odoo"] = filled_in
+                result["filled_in_by_odoo"] = [_one_line(f) for f in filled_in] if compact else filled_in
             if totals:
                 result["totals"] = totals
+            if compact:
+                warnings.append(
+                    f"What Odoo fills in and the totals are shown for the first {_FULL_PREVIEW_RECORDS} records; the "
+                    "others were checked for required fields."
+                )
             result.update({
                 "warnings": warnings,
                 "confirm_token": self.shared.signer.issue(payload),
                 "next_step": "Show this preview to the person (with what Odoo fills in and the totals). Only if they "
                 "approve, call odoo_create with exactly the same model, records and context plus this confirm_token "
-                "(valid 15 minutes).",
+                f"(valid {self.shared.signer.valid_for}).",
             })
-            return result
+            return self._fits_preview(result)
 
     async def _new_record(self, model: str, values: dict, ctx: dict) -> dict | None:
         """What Odoo itself fills in on a new record with these values: its onchange, as its own form runs it.
@@ -1968,6 +2073,8 @@ class OdooService:
         ]
         if model == ATTACHMENT_MODEL:
             await self._file_moves(normalized_groups)
+        if model in ACCOUNTING_SETUP_MODELS:
+            await self._setup_edit_checks(model, normalized_groups)
         fingerprint = await self._fingerprint(model, all_ids, list(dict.fromkeys(n for _, norm in normalized_groups for n in norm)))
         fields_meta = await self._fields(model)
         for _, normalized in normalized_groups:
@@ -1978,6 +2085,10 @@ class OdooService:
                         line_fields = sorted({f for fs in edited.values() for f in fs})
                         lines = await self._fingerprint(fields_meta[name]["relation"], sorted(edited), line_fields)
                         fingerprint.setdefault(f"lines:{name}", {}).update(lines)
+                    removed = sorted(cmd[1] for cmd in value if cmd and cmd[0] == 2)
+                    if removed:  # the lines as the person was shown them
+                        lines = await self._fingerprint(fields_meta[name]["relation"], removed, list(_LINE_SHOWN))
+                        fingerprint.setdefault(f"removed:{name}", {}).update(lines)
         payload: dict[str, Any] = {"op": "update", "who": self.user_key, "model": model}
         if len(normalized_groups) == 1:
             payload.update(ids=sorted(all_ids), values=normalized_groups[0][1])
@@ -1985,6 +2096,47 @@ class OdooService:
             payload["changes"] = [{"ids": sorted(group_ids), "values": norm} for group_ids, norm in normalized_groups]
         payload.update(context=ctx, fingerprint=fingerprint)
         return normalized_groups, ctx, payload
+
+    async def _setup_edit_checks(self, model: str, groups: list[tuple[list[int], dict]]) -> None:
+        """What the field rules cannot see on existing accounting setup, asked from Odoo (before the approval and
+        again at the change): an account is archived only when it has no journal items, and gets account tags only."""
+        if model != "account.account":
+            return
+        archiving = sorted({i for group_ids, values in groups if values.get("active") is False for i in group_ids})
+        if archiving:
+            used = await self._accounts_with_entries(archiving)
+            if used:
+                names = await self._names(model, set(used))
+                which = ", ".join(names.get(i) or f"account {i}" for i in used)
+                raise PolicyViolation(
+                    f"{which} already has journal items, so it cannot be archived through Claude: past entries and "
+                    "reports use it. Claude archives only accounts without journal items; a person decides in Odoo"
+                )
+        tags = sorted({i for _, values in groups for i in _linked_ids(values.get("tag_ids"))})
+        if tags and "applicability" in await self._fields("account.account.tag"):
+            rows = await self.client.call(
+                "account.account.tag", "read", ids=tags, fields=["name", "applicability"], context={"active_test": False}
+            )
+            wrong = [row.get("name") or f"tag {row['id']}" for row in rows or [] if row.get("applicability") != "accounts"]
+            if wrong:
+                raise ValidationFailed(
+                    f"{', '.join(wrong)} is not an account tag (it is for taxes or products), so it cannot be put on an "
+                    "account. Choose tags made for accounts"
+                )
+
+    async def _accounts_with_entries(self, ids: list[int]) -> list[int]:
+        """The accounts among ids that have journal items, in any company (Odoo's own 'used' check)."""
+        if "used" in await self._fields("account.account"):
+            found = await self.client.call(
+                "account.account", "search", domain=[["id", "in", ids], ["used", "in", [True]]],
+                context={"active_test": False},
+            )
+            return sorted(found or [])
+        used = []  # an Odoo without the 'used' field: ask per account
+        for account_id in ids:
+            if await self.client.call("account.move.line", "search_count", domain=[["account_id", "=", account_id]], limit=1):
+                used.append(account_id)
+        return used
 
     async def preview_update(self, model: str, ids: Any, values: Any, context: Any, changes: Any = None) -> dict:
         async with self._op("odoo_preview_update", "read", model=model, ids=_audit_ids(ids, changes)):
@@ -1995,13 +2147,22 @@ class OdooService:
             scalar = {i: [n for n in norm if fields[n].get("type") not in ("one2many", "many2many")] for g, norm in groups for i in g}
             read = list(dict.fromkeys(n for names in scalar.values() for n in names))
             current = await self.client.call(model, "read", ids=all_ids, fields=["display_name", *read], context=self._read_context(True))
+            compact = len(all_ids) > _FULL_PREVIEW_RECORDS
             new_values = {}
+            preview_changes: list[dict] = []
+            lines_of: dict[int, list[str]] = {}  # compact: each group's one-line-per-record list, by record id
             for group_ids, normalized in groups:
                 described = await self._describe_values(model, normalized)
                 new_values.update(dict.fromkeys(group_ids, described))
-            preview_changes = []
+                if compact:  # the new values once per group, then one line per record with what it has now
+                    preview_changes.append({"new": described, "records": []})
+                    lines_of.update(dict.fromkeys(group_ids, preview_changes[-1]["records"]))
             for row in current or []:
                 before = await self._describe_values(model, {n: row.get(n) for n in scalar.get(row["id"], [])})
+                if compact:
+                    now = f": now {_one_line(before)}" if before else ""
+                    lines_of[row["id"]].append(f"{row.get('display_name')} (id {row['id']}){now}")
+                    continue
                 preview_changes.append({
                     "id": row["id"], "record": row.get("display_name"), "current": before, "new": new_values.get(row["id"]),
                     "link": self._link(model, row["id"]),
@@ -2010,6 +2171,8 @@ class OdooService:
                 "preview": f"Update {len(all_ids)} {model} record(s)" + (f" in {len(groups)} different ways" if len(groups) > 1 else ""),
                 "changes": preview_changes,
             }
+            if compact:
+                result["links"] = f"Each record opens at {self.client.creds.url}/odoo/{model}/<id>"
             if model == ATTACHMENT_MODEL:
                 result = {"preview": f"Move {len(all_ids)} file(s)", "moves": await self._file_moves(groups)}
             warnings = self._change_warnings(
@@ -2020,9 +2183,10 @@ class OdooService:
             result["confirm_token"] = self.shared.signer.issue(payload)
             result["next_step"] = (
                 "Show the current vs new values to the person. Only if they approve, call odoo_update with exactly the "
-                "same model, ids, values (or changes) and context plus this confirm_token (valid 15 minutes)."
+                "same model, ids, values (or changes) and context plus this confirm_token "
+                f"(valid {self.shared.signer.valid_for})."
             )
-            return result
+            return self._fits_preview(result)
 
     async def update(self, model: str, ids: Any, values: Any, context: Any, confirm_token: str | None, changes: Any = None) -> dict:
         names = list(values) if isinstance(values, dict) else _audit_fields(changes)
@@ -2064,7 +2228,7 @@ class OdooService:
         self.policy.check_write(model)
         if not isinstance(method, str):
             raise ValidationFailed("method must be the button's method name from odoo_list_actions")
-        id_list = self._check_ids(ids, self.settings.mcp_max_write_records)
+        id_list = self._check_ids(ids, self.settings.mcp_max_action_records)
         buttons = await self._buttons(model)
         if f"method:{method}" not in buttons:
             # the list is cached; a button may have appeared since (e.g. a setting was switched on)
@@ -2169,6 +2333,97 @@ class OdooService:
             answer.update(await self._explain_action_result(result))
             return answer
 
+    # ------------------------------------------------------------------ deleting: a few kinds of records only
+
+    async def _prepare_delete(self, model: str, ids: Any) -> tuple[list[int], dict[int, str], dict]:
+        """Checks a delete with Odoo; returns the ids, their names, and what the approval is bound to.
+
+        Runs at the preview and again at the change, so a record that changed in between (posted, restored,
+        unarchived) is refused even with a valid approval.
+        """
+        self.policy.check_delete(model)
+        id_list = self._check_ids(ids, self.settings.mcp_max_action_records)
+        present, missing = await self._existing(model, id_list)
+        if missing:
+            raise ValidationFailed(f"{model} records {missing} do not exist or are not visible to you")
+        fields = await self._fields(model)
+        checked = [f for f in _DELETE_CHECK_FIELDS if f in fields]
+        rows = await self.client.call(
+            model, "read", ids=id_list, fields=["display_name", *checked], context={"active_test": False}
+        )
+        names = {row["id"]: row.get("display_name") or f"{model} {row['id']}" for row in rows or []}
+        refused = [f"'{names[row['id']]}' {why}" for row in rows or [] if (why := _not_deletable(model, row, fields))]
+        if refused:
+            raise PolicyViolation(
+                f"{'; '.join(refused)}. Claude can delete only {DELETABLE_TEXT}. Archive or cancel instead where that "
+                "is allowed, or a person deletes it in Odoo"
+            )
+        fingerprint = await self._fingerprint(model, id_list, checked)
+        payload = {"op": "delete", "who": self.user_key, "model": model, "ids": sorted(id_list), "fingerprint": fingerprint}
+        return id_list, names, payload
+
+    async def preview_delete(self, model: str, ids: Any) -> dict:
+        async with self._op("odoo_preview_delete", "read", model=model, ids=ids if isinstance(ids, list) else None):
+            id_list, _, payload = await self._prepare_delete(model, ids)
+            await self._odoo_allows(model, "unlink", id_list)
+            warnings = ["Each record is gone for good once deleted, with its lines, notes, messages and activities."]
+            files = await self._attached_files(model, id_list)
+            if files:
+                warnings.append(
+                    f"{files} file(s) attached to these records (for example a bill's PDF) are deleted with them. To "
+                    "keep a file, move it onto another entry first (odoo_help topic files)."
+                )
+            result: dict[str, Any] = {
+                "preview": f"Delete {len(id_list)} {model} record(s). Deleting cannot be undone: they cannot be "
+                "brought back, in Odoo or through Claude.",
+                "records": await self._summaries(model, id_list, check=False, steps=False),
+                "warnings": warnings,
+                "confirm_token": self.shared.signer.issue(payload),
+                "next_step": "Show the person every record listed, with its name and link, and say plainly that deleting "
+                "cannot be undone. Only if they approve, call odoo_delete with exactly the same model and ids plus this "
+                f"confirm_token (valid {self.shared.signer.valid_for}).",
+            }
+            return self._fits_preview(result)
+
+    async def _attached_files(self, model: str, ids: list[int]) -> int | None:
+        """How many files are attached to these records (Odoo deletes them with the records); None if unknown."""
+        try:
+            return await self.client.call(
+                ATTACHMENT_MODEL, "search_count", domain=[["res_model", "=", model], ["res_id", "in", ids]]
+            )
+        except OdooError as exc:
+            if exc.key_rejected:
+                raise
+            return None
+
+    async def delete(self, model: str, ids: Any, confirm_token: str | None) -> dict:
+        async with self._change("odoo_delete", model=model, ids=ids if isinstance(ids, list) else None) as attempt:
+            id_list, names, payload = await self._prepare_delete(model, ids)
+            token = self._approve(confirm_token, payload, always=True)  # deleting always needs the person's approval
+            await self._send(
+                attempt, token, lambda: self.client.delete_records(model, id_list),
+                check=lambda: self._still_there(model, id_list),
+            )
+            answer: dict[str, Any] = {
+                "deleted": [{"id": i, "name": names.get(i)} for i in id_list],
+                "model": model,
+                "message": f"Deleted {len(id_list)} {model} record(s) for good.",
+            }
+            try:
+                left, _ = await self._in_time(self._existing(model, id_list), attempt)
+            except Exception as exc:  # the records were deleted: a failed read must not turn this into an error
+                logger.warning("read-back after odoo_delete failed: %s", type(exc).__name__)
+                return answer
+            if left:  # Odoo said it deleted them; say so if any is still there
+                answer["still_in_odoo"] = left
+                answer["message"] = f"Odoo answered, but {len(left)} of the records are still there: {left}."
+            return answer
+
+    async def _still_there(self, model: str, ids: list[int]) -> str:
+        """After a delete with an unknown outcome: which records Odoo still has."""
+        present, gone = await self._existing(model, ids)
+        return f"Still in Odoo: {present or 'none'}. No longer in Odoo (deleted): {gone or 'none'}."
+
     # ------------------------------------------------------------------ dialogs: one preview, one approval
 
     async def _preview_dialog(self, model: str, ids: Any, method: str, context: Any, dialog_values: Any) -> dict:
@@ -2186,7 +2441,7 @@ class OdooService:
         result["next_step"] = (
             "Tell the person in plain words what Odoo will do (the records and the dialog values). Only if they "
             "approve, call odoo_run_action with exactly the same model, ids, method, context and dialog_values plus "
-            "this confirm_token (valid 15 minutes)."
+            f"this confirm_token (valid {self.shared.signer.valid_for})."
         )
         return result
 
@@ -2229,7 +2484,7 @@ class OdooService:
         self, model: str, ids: Any, method: str, context: Any, dialog_values: Any, *, check_access: bool = False
     ) -> _DialogPlan:
         self.policy.check_write(model)
-        id_list = self._check_ids(ids, self.settings.mcp_max_write_records)
+        id_list = self._check_ids(ids, self.settings.mcp_max_action_records)
         dialog, button = await self._dialog_button(model, method)
         label = button.get("label") or method
         if dialog.one_record and len(id_list) > 1:
@@ -2617,7 +2872,7 @@ class OdooService:
 
     def _action_cap(self) -> int:
         """Records per approval for buttons, sending and similar actions."""
-        return getattr(self.settings, "mcp_max_action_records", self.settings.mcp_max_write_records)
+        return self.settings.mcp_max_action_records
 
     async def _followers_plan(self, model: str, ids: Any, add: Any, remove: Any) -> tuple[list[int], list[int], list[int], dict, dict]:
         """Checks a change of followers; returns (ids, add, remove, the people by id, the approval payload).

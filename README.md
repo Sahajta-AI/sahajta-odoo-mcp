@@ -8,7 +8,7 @@ It is built safety-first, because all company data lives in Odoo:
 
 | Guarantee | How |
 |---|---|
-| **Nothing can ever be deleted** | No delete tool exists; `unlink` is refused at three separate layers; line-item commands that delete rows indirectly are rejected. |
+| **Almost nothing can be deleted** | One delete tool, for three kinds of records only: draft invoices/bills that never had a number, cancelled quotations, archived leads (checked with Odoo before the approval and again right before deleting). `unlink` is refused on every other path; lines can be removed only from quotations, RFQs and draft invoices. |
 | **Claude acts as the person, never as admin** | Each employee signs in with their *own* Odoo API key. Odoo's normal permissions and record rules apply to everything. |
 | **Read-only unless you switch it on** | Default mode exposes search/read/report tools only. Change tools don't even appear until `MCP_ACCESS_MODE=read_write`. |
 | **No hallucinated changes** | Every field name, choice value and record id is checked against the live Odoo before anything is sent; unknown ones are rejected with a "did you mean…?" hint. |
@@ -40,6 +40,7 @@ integration (this one, Odoo's own MCP, or any community server) can connect.
 | `odoo_preview_create` → `odoo_create` | Create records (with order lines etc.) | read_write |
 | `odoo_preview_update` → `odoo_update` | Change field values | read_write |
 | `odoo_preview_action` → `odoo_run_action` | Press a workflow button (confirm order, validate…) | read_write |
+| `odoo_preview_delete` → `odoo_delete` | Delete a never-numbered draft invoice/bill, a cancelled quotation or an archived lead | read_write |
 | `odoo_add_note` | Log an internal note in the chatter (nobody is e-mailed) | read_write |
 | `odoo_preview_message` → `odoo_send_message` | Message a record's followers (e-mails customers) | read_write + outbound |
 
@@ -97,7 +98,9 @@ All settings are environment variables; [.env.example](.env.example) documents e
 | `MCP_ALLOW_OUTBOUND_MESSAGES` | `false` | allow anything that e-mails/messages people |
 | `MCP_WRITABLE_MODELS` | *(all business models)* | restrict changes to a list, e.g. `crm.lead,res.partner,project.task` |
 | `MCP_BLOCKED_MODELS` / `MCP_READONLY_MODELS` | *(none)* | extra restrictions, globs allowed (`hr.*`) |
-| `MCP_MAX_WRITE_RECORDS` | `20` | max records one change may touch (hard cap 100) |
+| `MCP_MAX_WRITE_RECORDS` | `100` | max records one create or edit may touch (hard cap 100) |
+| `MCP_MAX_ACTION_RECORDS` | `20` | max records one button, dialog, message or delete may touch (hard cap 100) |
+| `MCP_CONFIRM_TTL_SECONDS` | `3600` | how long an approved preview stays usable (hard cap 24 hours) |
 
 ## Development
 

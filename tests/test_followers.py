@@ -160,11 +160,8 @@ async def test_archived_contacts_and_records_the_person_may_not_edit_are_refused
 
 
 async def test_followers_use_the_action_cap(fake):
-    svc = make_service(fake, mcp_allow_outbound_messages=True, mcp_max_write_records=1)
-    with pytest.raises(ValidationFailed, match="the limit is 1"):
-        await svc.preview_followers("crm.lead", [100, 101], [2], None)
-    svc = make_service(fake, mcp_allow_outbound_messages=True, mcp_max_write_records=50)
-    object.__setattr__(svc.settings, "mcp_max_action_records", 1)  # the separate cap, where the settings have it
+    # followers e-mail people, so they count against the action cap, not the larger cap for edits
+    svc = make_service(fake, mcp_allow_outbound_messages=True, mcp_max_write_records=50, mcp_max_action_records=1)
     with pytest.raises(ValidationFailed, match="the limit is 1"):
         await svc.preview_followers("crm.lead", [100, 101], [2], None)
     with pytest.raises(ValidationFailed, match="too many contacts"):

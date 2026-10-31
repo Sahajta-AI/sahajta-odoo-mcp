@@ -491,6 +491,8 @@ class FakeOdoo:
     access: dict[tuple[str, str], bool] = field(default_factory=dict)
     # the menus the user sees, {xml id: "App → Menu → Item"}, served as ir.ui.menu load_menus; None: no such call
     menus: dict[str, str] | None = None
+    # what reached the one delete path (OdooClient.delete_records): [(model, ids)]
+    deleted: list[tuple[str, list[int]]] = field(default_factory=list)
 
     instances = []  # class-level registry (not a dataclass field: no annotation)
 
@@ -541,6 +543,16 @@ class FakeOdoo:
         if (model, method) in self.action_results:
             return self.action_results[(model, method)]
         return True  # any other (button) method
+
+    async def delete_records(self, model: str, ids: list[int]) -> bool:
+        """OdooClient's one delete path. Recorded as a call named delete_records (never 'unlink'), plus in deleted."""
+        self.calls.append(Call(model, "delete_records", list(ids), None, {}))
+        if (model, "delete_records") in self.errors:
+            raise self.errors[(model, "delete_records")]
+        self.deleted.append((model, list(ids)))
+        for rid in ids:
+            self._store(model).pop(rid, None)
+        return True
 
     # ----------------------------------------------------------------- method emulation
 
