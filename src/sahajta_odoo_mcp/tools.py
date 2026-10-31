@@ -120,7 +120,8 @@ OptionalValues = Annotated[
     dict[str, Any] | None,
     Field(
         description="Fields to change: {field: new value}. To add lines: \"order_line\": [{...}]; to edit a line: "
-        "\"order_line\": [[1, line_id, {...}]]. Removing lines is not allowed."
+        "\"order_line\": [[1, line_id, {...}]]; to remove a line from a quotation, RFQ or draft invoice/bill: "
+        "[[2, line_id, 0]] (order_line, or invoice_line_ids on account.move)."
     ),
 ]
 Changes = Annotated[
@@ -334,6 +335,20 @@ def register_tools(
         result; for a dialog button it also fills in the dialog and presses its confirm button. Returns the records'
         new status with links, or the next step if Odoo opened another wizard."""
         return await run(lambda s: s.run_action(model, ids, method, context, confirm_token, dialog_values), model=model)
+
+    @mcp.tool(title="Preview deleting records", annotations=preview("Preview deleting records"), structured_output=False)
+    async def odoo_preview_delete(model: Model, ids: Ids) -> str:
+        """Check that these records may be deleted and list every one (name, status, link), WITHOUT deleting
+        anything. Only draft invoices, bills or entries that never had a number (account.move), cancelled quotations
+        or sales orders (sale.order) and archived leads (crm.lead) can be deleted. Returns a confirm_token for
+        odoo_delete."""
+        return await run(lambda s: s.preview_delete(model, ids), model=model)
+
+    @mcp.tool(title="Delete records", annotations=change("Delete records"), structured_output=False)
+    async def odoo_delete(model: Model, ids: Ids, confirm_token: ConfirmToken = None) -> str:
+        """Delete records for good, after the person approved the odoo_preview_delete result. Pass exactly the
+        previewed model and ids plus its confirm_token. This cannot be undone."""
+        return await run(lambda s: s.delete(model, ids, confirm_token), model=model)
 
     @mcp.tool(title="Log an internal note", annotations=change("Log an internal note"), structured_output=False)
     async def odoo_add_note(

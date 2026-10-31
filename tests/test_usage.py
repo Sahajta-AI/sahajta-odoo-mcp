@@ -76,18 +76,18 @@ def test_report_aggregates_and_formats():
         ("odoo_search", "ok", "crm.lead", None), ("odoo_search", "ok", "crm.lead", None),
         ("odoo_create", "ok", "crm.lead", None), ("odoo_update", "ok", "crm.lead", [1, 2]),
         ("odoo_search", "blocked", "ir.config_parameter", None), ("odoo_update", "error", "sale.order", [5]),
-        ("connect", "error", None, None),
+        ("connect", "error", None, None), ("odoo_delete", "ok", "account.move", [7, 8, 9]),
     ]:
         log.record({"user": "s@x", "tool": tool, "outcome": outcome, "model": model, "ids": ids, "detail": "boom"})
     report = log.report(7)
-    assert report["tool_calls"] == 6 and report["errors"] == 2 and report["blocked"] == 1
-    assert report["changes"] == {"created": 1, "updated": 2}
+    assert report["tool_calls"] == 7 and report["errors"] == 2 and report["blocked"] == 1
+    assert report["changes"] == {"created": 1, "updated": 2, "deleted": 3}
     assert report["by_tool"]["odoo_search"] == {"ok": 2, "blocked": 1}
-    assert report["by_user"] == {"s@x": 6}
+    assert report["by_user"] == {"s@x": 7}
     assert report["top_models"][0] == ["crm.lead", 4] or report["top_models"][0] == ("crm.lead", 4)
     assert len(report["problems"]) == 3
     text = format_report(json.loads(json.dumps(report)))
-    assert "Tool calls: 6" in text and "blocked by safety rules: 1" in text and "Recent problems:" in text
+    assert "Tool calls: 7" in text and "blocked by safety rules: 1" in text and "Recent problems:" in text
 
 
 async def test_tool_calls_and_blocked_calls_are_recorded_end_to_end(odoo, shared_redis):

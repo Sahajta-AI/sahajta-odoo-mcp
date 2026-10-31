@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from conftest import AUDIT_FIELDS, FakeOdoo, _f, add_setup_models
-from sahajta_odoo_mcp.errors import OdooMCPError, PolicyViolation
+from sahajta_odoo_mcp.errors import OdooMCPError, PolicyViolation, ValidationFailed
 from test_service_offline import make_service
 
 
@@ -87,8 +87,9 @@ async def test_editing_a_matching_rule_previews_with_its_warnings(fake):
     assert fake.records["account.reconcile.model"][90]["trigger"] == "auto_reconcile"
 
 
-async def test_other_accounting_setup_stays_create_only(fake):
+async def test_a_tax_rate_stays_unchangeable(fake):
     svc = make_service(fake, mcp_access_mode="read_write")
-    fake.records["account.tax"] = {1: {"name": "GST 18%"}}
-    with pytest.raises(PolicyViolation, match="past reports and GST returns"):
-        await svc.preview_update("account.tax", [1], {"name": "GST 18% S"}, None)
+    fake.schema["account.tax"]["amount"] = {"type": "float", "string": "Amount", "store": True}
+    fake.records["account.tax"] = {1: {"name": "GST 18%", "amount": 18.0}}
+    with pytest.raises(ValidationFailed, match="past reports and GST returns"):
+        await svc.preview_update("account.tax", [1], {"amount": 12.0}, None)

@@ -4,7 +4,8 @@ The point is twofold:
   * anti-hallucination: field names, selection values and record ids must really
     exist in this Odoo, otherwise the request is rejected with a helpful hint;
   * safety: relational "commands" that would delete or detach existing records
-    (one2many/many2many commands 2, 3, 5, 6 and friends) are refused.
+    (one2many/many2many commands 2, 3, 5, 6 and friends) are refused. The one exception is removing a
+    line from a document that is still a draft (policy.LINE_REMOVAL), whose state is asked from Odoo.
 """
 
 from __future__ import annotations
@@ -449,6 +450,8 @@ class Validator:
             raise ValidationFailed(f"{label} must be a list of new lines (objects) or of [0, 0, {{...}}] / [1, id, {{...}}] commands")
         commands: list = []
         existing: set[int] | None = None
+        touched: set[int] = set()  # lines removed or edited: each at most once
+        removing = False  # the document's state was checked for removing lines
         for command in value:
             if isinstance(command, dict):
                 command = [0, 0, command]
@@ -472,9 +475,35 @@ class Validator:
                     existing = await self._current_line_ids(model, name, record_ids)
                 if rid not in existing:
                     raise ValidationFailed(f"{label}: line {rid} does not belong to the record(s) being changed")
+                if rid in touched:
+                    raise ValidationFailed(f"{label}: line {rid} is listed twice; give each line one command")
+                touched.add(rid)
                 _spend(refs, label)
                 vals = await self._normalize_values(comodel, _command_vals(label, command), mode="write", record_ids=[rid], depth=depth + 1, refs=refs, inverse=inverse)
                 commands.append([1, rid, vals])
+            elif code == 2 and depth == 0 and self.policy.line_removal_states(model, name) is not None:
+                # removing a line deletes it: only from a document that is still a draft (asked from Odoo each time)
+                self.policy.check_nested_write(model, name, comodel, creating=False)
+                rid = _command_id(label, command)
+                if mode != "write" or not record_ids:
+                    raise ValidationFailed(f"{label}: lines can only be removed from an existing record")
+                if not removing:
+                    await self._check_line_removal(model, name, record_ids)
+                    removing = True
+                if existing is None:
+                    existing = await self._current_line_ids(model, name, record_ids)
+                if rid not in existing:
+                    raise ValidationFailed(f"{label}: line {rid} does not belong to the record(s) being changed")
+                if rid in touched:
+                    raise ValidationFailed(f"{label}: line {rid} is listed twice; give each line one command")
+                touched.add(rid)
+                _spend(refs, label)
+                commands.append([2, rid, 0])
+            elif code in (2, 3, 5, 6) and depth == 0 and self.policy.line_removal_states(model, name) is not None:
+                raise ValidationFailed(
+                    f"{label}: command {code} would detach or replace lines, which is not allowed; to remove one line "
+                    "use [2, line_id, 0] (only while the document is a draft)"
+                )
             elif code in (2, 3, 5, 6):
                 raise ValidationFailed(
                     f"{label}: command {code} would delete or detach existing lines; removing lines is not allowed "
@@ -485,6 +514,19 @@ class Validator:
             else:
                 raise ValidationFailed(f"{label}: unknown command {code}")
         return commands
+
+    async def _check_line_removal(self, model: str, name: str, record_ids: list[int]) -> None:
+        """Lines may be removed only while every document being changed is in an allowed state, asked from Odoo."""
+        allowed = self.policy.line_removal_states(model, name) or frozenset()
+        rows = await self.client.call(
+            model, "read", ids=record_ids, fields=["display_name", "state"], context={"active_test": False}
+        )
+        refused = [
+            self.policy.line_removal_refusal(model, row.get("display_name") or f"{model} {row['id']}")
+            for row in rows or [] if row.get("state") not in allowed
+        ]
+        if refused:
+            raise PolicyViolation("; ".join(refused))
 
     async def _current_line_ids(self, model: str, name: str, record_ids: list[int]) -> set[int]:
         rows = await self.client.call(model, "read", ids=record_ids, fields=[name], context={"active_test": False})

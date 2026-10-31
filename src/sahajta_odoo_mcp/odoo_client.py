@@ -32,8 +32,12 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = f"sahajta-odoo-mcp/{__version__}"
 
-# Last line of defence, independent of the policy module: these never leave this process.
+# Last line of defence, independent of the policy module: these never leave this process through call().
 _NEVER_SENT = ("unlink", "uninstall", "sudo")
+# The one exception: delete_records() sends unlink, only for these models (checked here again, whatever the policy
+# module says) and only for explicit ids. The service's delete tool is its only caller.
+_DELETABLE_MODELS = frozenset({"account.move", "sale.order", "crm.lead"})
+_MAX_DELETE_IDS = 100
 
 # Read-only methods are retried when Odoo is busy; changes are never retried automatically.
 _SAFE_TO_RETRY = frozenset(
@@ -165,6 +169,24 @@ class OdooClient:
             raise OdooError(f"refusing to send '{method}' to Odoo", kind="access")
         if model in HARD_BLOCKED_MODELS or model.startswith(HARD_BLOCKED_PREFIXES):
             raise OdooError(f"refusing to call blocked model '{model}'", kind="access")
+        return await self._send(model, method, ids=ids, context=context, kwargs=kwargs)
+
+    async def delete_records(self, model: str, ids: list[int]) -> Any:
+        """Deletes these records: the only path that sends unlink, for a few models and explicit ids only.
+
+        Never retried, like every change. call() keeps refusing unlink for every model, so no other tool or
+        button can delete.
+        """
+        if model not in _DELETABLE_MODELS:
+            raise OdooError(f"refusing to delete {model} records", kind="access")
+        if not (
+            isinstance(ids, list) and 0 < len(ids) <= _MAX_DELETE_IDS
+            and all(isinstance(i, int) and not isinstance(i, bool) and i > 0 for i in ids)
+        ):
+            raise OdooError("refusing to delete: give 1 to 100 record ids", kind="access")
+        return await self._send(model, "unlink", ids=list(ids), context=None, kwargs={})
+
+    async def _send(self, model: str, method: str, *, ids: list[int] | None, context: dict | None, kwargs: dict) -> Any:
         await self._ensure_protocol()
         if self._base_context:
             context = {**self._base_context, **(context or {})}

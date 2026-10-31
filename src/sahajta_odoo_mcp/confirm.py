@@ -16,10 +16,20 @@ import json
 import time
 from typing import Any
 
+from .config import DEFAULT_CONFIRM_TTL_SECONDS
 from .errors import ConfirmationRequired
 from .state import MemoryState, SharedState
 
-DEFAULT_TTL_SECONDS = 15 * 60
+DEFAULT_TTL_SECONDS = DEFAULT_CONFIRM_TTL_SECONDS
+
+
+def duration_text(seconds: int) -> str:
+    """How long an approval stays usable, in words: '1 hour', '2 hours', '90 minutes'."""
+    if seconds >= 3600 and seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"{hours} hour{'s' if hours != 1 else ''}"
+    minutes = max(1, seconds // 60)
+    return f"{minutes} minute{'s' if minutes != 1 else ''}"
 
 
 def canonical(payload: Any) -> bytes:
@@ -32,6 +42,7 @@ class ConfirmationSigner:
             raise ValueError("confirmation secret too short")
         self._key = hashlib.sha256(b"sahajta-odoo-mcp/confirm/v1" + secret).digest()
         self._ttl = ttl_seconds
+        self.valid_for = duration_text(ttl_seconds)  # for texts: "valid 1 hour"
         # Tokens are single-use: one approval = one change (no duplicate creates or repeated e-mails).
         self._state = state or MemoryState()
 
@@ -51,7 +62,7 @@ class ConfirmationSigner:
             raise ConfirmationRequired("confirm_token is malformed; run the preview again.")
         expires = int(expires_text)
         if expires < time.time():
-            raise ConfirmationRequired("confirm_token has expired (15 minutes); run the preview again.")
+            raise ConfirmationRequired(f"confirm_token has expired ({self.valid_for}); run the preview again.")
         if not hmac.compare_digest(mac, self._mac(expires, payload)):
             raise ConfirmationRequired(
                 "confirm_token does not match this change. Either the arguments differ from the preview, or the "

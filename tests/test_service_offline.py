@@ -349,9 +349,10 @@ async def test_update_refuses_dangerous_values(svc, fake):
             await svc.preview_update("crm.lead", [100], values, None)
     for values, needle in [
         ({"state": "sale"}, "workflow"),
-        ({"order_line": [[2, 50, 0]]}, "delete"),
-        ({"order_line": [[5, 0, 0]]}, "delete"),
-        ({"order_line": [[6, 0, []]]}, "delete"),
+        ({"order_line": [[3, 50, 0]]}, "detach or replace"),
+        ({"order_line": [[5, 0, 0]]}, "detach or replace"),
+        ({"order_line": [[6, 0, []]]}, "detach or replace"),
+        ({"order_line": [[2, 60, 0]]}, "does not belong"),
         ({"order_line": [50]}, "replace"),
         ({"order_line": [[1, 60, {"product_uom_qty": 3}]]}, "does not belong"),
     ]:
@@ -676,10 +677,14 @@ async def test_describe_model_hides_secrets_and_explains_write_rules(svc):
         await svc.describe_model("res.users.apikeys", None, None)
 
 
-async def test_whoami_never_claims_delete_rights(svc):
+async def test_whoami_names_the_only_records_that_can_be_deleted(svc, fake):
     out = await svc.whoami()
-    assert out["permissions"]["can_delete_records"] is False
+    assert out["permissions"]["can_delete_records"].startswith("only draft invoices, bills or entries that never had")
+    assert out["permissions"]["max_records_per_button_message_or_delete"] == 20
+    assert out["permissions"]["approval_valid_for"] == "1 hour"
     assert out["user"]["id"] == 7
+    read_only = await make_service(fake, mcp_access_mode="read_only").whoami()
+    assert read_only["permissions"]["can_delete_records"] is False
 
 
 # ======================================================================================= notes and messages
@@ -823,7 +828,7 @@ async def test_a_setting_is_changed_by_a_new_settings_record_then_save(setup_fak
 
 async def test_accounting_setup_changes_are_refused_before_anything_is_sent(setup_fake):
     svc = make_service(setup_fake, mcp_require_preview=False, mcp_allow_archive=True)
-    with pytest.raises(PolicyViolation, match="past reports and GST returns"):
+    with pytest.raises(ValidationFailed, match="past reports and GST returns"):
         await svc.update("account.tax", [1], {"amount": 12.0}, None, None)
     with pytest.raises(PolicyViolation, match="accounting setup"):
         await svc.run_action("account.tax", [1], "action_archive", None, None)

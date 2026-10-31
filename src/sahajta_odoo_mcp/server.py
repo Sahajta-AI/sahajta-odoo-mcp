@@ -63,7 +63,7 @@ def build_shared(
         settings=settings,
         policy=SafetyPolicy(settings),
         schema=SchemaCache(shared=state),
-        signer=ConfirmationSigner(secret, state=state),
+        signer=ConfirmationSigner(secret, ttl_seconds=settings.mcp_confirm_ttl_seconds, state=state),
         audit=AuditLog(settings.mcp_audit_log_file, usage=usage),
         limiter=RateLimiter(settings.mcp_reads_per_minute, settings.mcp_writes_per_minute, state=state),
         http=http or new_http_client(verify=settings.odoo_verify_tls),

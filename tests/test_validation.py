@@ -958,12 +958,13 @@ async def test_one2many_edit_is_impossible_on_create(v):
 @pytest.mark.parametrize(
     "command, needle",
     [
-        ([2, 50, 0], "delete or detach"),
-        ([3, 50, 0], "delete or detach"),
-        ([5, 0, 0], "delete or detach"),
-        ([5], "delete or detach"),
-        ([6, 0, []], "delete or detach"),
-        ([6, 0, [50]], "delete or detach"),
+        ([3, 50, 0], "detach or replace"),
+        ([5, 0, 0], "detach or replace"),
+        ([5], "detach or replace"),
+        ([6, 0, []], "detach or replace"),
+        ([6, 0, [50]], "detach or replace"),
+        ([2, 60, 0], "does not belong"),  # a line of another order
+        ([2, 0, 0], "needs a record id"),
         ([4, 60, 0], "move a line away"),
         ([9, 0, 0], "unknown command"),
     ],
@@ -1173,12 +1174,16 @@ async def test_accounting_setup_is_created_with_its_lines(setup_fake):
     assert await v.normalize_values("account.account", {"name": "GST Payable", "code": "2101"}, mode="create")
 
 
-async def test_accounting_setup_is_never_changed_or_archived(setup_fake):
+async def test_existing_accounting_setup_keeps_its_rate_code_and_type(setup_fake):
     v = make_validator(setup_fake, mcp_allow_archive=True)
-    for model, rid, values in [("account.tax", 1, {"amount": 12.0}), ("account.tax", 1, {"active": False}),
-                               ("account.account", 50, {"code": "4001"}), ("account.journal", 60, {"name": "x"})]:
-        with pytest.raises(PolicyViolation, match="changes past reports and GST returns"):
-            await v.normalize_values(model, values, mode="write", record_ids=[rid])
+    for model, rid, values in [("account.tax", 1, {"amount": 12.0}), ("account.tax", 1, {"type_tax_use": "purchase"}),
+                               ("account.account", 50, {"code": "4001"}), ("account.journal", 60, {"code": "X"}),
+                               ("account.journal", 60, {"type": "bank"})]:
+        await rejected(v.normalize_values(model, values, mode="write", record_ids=[rid]),
+                       "would alter past reports and GST returns")
+    # the agreed edits pass
+    assert await v.normalize_values("account.tax", {"active": False, "name": "GST 18% (old)"}, mode="write", record_ids=[1])
+    assert await v.normalize_values("account.journal", {"name": "Sales India"}, mode="write", record_ids=[60])
     # a tax's lines are part of it: they cannot be written through any other record
     setup_fake.schema["sale.order"]["x_tax_line_ids"] = {
         "type": "one2many", "string": "Tax lines", "relation": "account.tax.repartition.line", "relation_field": "x_order_id",

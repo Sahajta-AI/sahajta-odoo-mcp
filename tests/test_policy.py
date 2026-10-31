@@ -698,8 +698,9 @@ def test_active_domain_is_refused(domain, everything_on):
         everything_on.sanitize_context({"active_domain": domain})
 
 
-def test_active_ids_are_capped_at_the_write_limit():
-    p = policy(mcp_access_mode="read_write", mcp_max_write_records=20)
+def test_active_ids_are_capped_at_the_action_limit():
+    # a dialog acts on whole records like a button: the action cap applies, not the larger create/edit cap
+    p = policy(mcp_access_mode="read_write", mcp_max_write_records=100, mcp_max_action_records=20)
     assert p.sanitize_context({"active_ids": list(range(1, 21))})["active_ids"] == list(range(1, 21))
     with pytest.raises(PolicyViolation, match="limit"):
         p.sanitize_context({"active_model": "sale.order", "active_ids": list(range(1, 22))})
@@ -711,10 +712,13 @@ def test_active_ids_are_capped_at_the_write_limit():
 
 
 def test_hard_caps_cannot_be_raised_by_environment():
-    s = build_settings(mcp_max_write_records=10_000, mcp_max_read_records=1_000_000, mcp_default_read_limit=5_000)
+    s = build_settings(mcp_max_write_records=10_000, mcp_max_read_records=1_000_000, mcp_default_read_limit=5_000,
+                       mcp_max_action_records=10_000, mcp_confirm_ttl_seconds=10**9)
     assert s.mcp_max_write_records == 100
+    assert s.mcp_max_action_records == 100
     assert s.mcp_max_read_records == 1000
     assert s.mcp_default_read_limit == 1000
+    assert s.mcp_confirm_ttl_seconds == 24 * 3600
 
 
 def test_safe_defaults_without_any_configuration():
@@ -725,7 +729,8 @@ def test_safe_defaults_without_any_configuration():
     assert s.read_write is False
     assert s.mcp_require_preview is True
     assert not (s.mcp_allow_archive or s.mcp_allow_cancel_actions or s.mcp_allow_outbound_messages)
-    assert s.mcp_max_write_records == 20
+    # create/edit up to 100 records; buttons, dialogs, messages and deleting up to 20; approvals last an hour
+    assert (s.mcp_max_write_records, s.mcp_max_action_records, s.mcp_confirm_ttl_seconds) == (100, 20, 3600)
 
 
 def test_odoo_url_must_be_http(monkeypatch):
@@ -943,17 +948,58 @@ def test_replying_to_messages_with_messages_is_refused_to_avoid_mail_loops():
     [("account.account", "Accounts"), ("account.tax", "Taxes"), ("account.fiscal.position", "Fiscal positions"),
      ("account.journal", "Journals")],
 )
-def test_accounting_setup_is_create_only(model, name, everything_on):
+def test_accounting_setup_is_created_freely_and_edited_only_field_by_field(model, name, everything_on):
     everything_on.check_write(model)
     assert everything_on.change_block_reason(model, "create") is None
-    reason = everything_on.change_block_reason(model, "write")
-    assert reason.startswith(f"{name} already in Odoo cannot be changed or archived")
-    assert "past reports and GST returns" in reason and "Do it in Odoo" in reason
-    # no wizard may act on existing setup either, and no button may be pressed on it
+    assert everything_on.change_block_reason(model, "write") is None  # the field rules below decide
+    # no wizard may act on existing setup, and no button may be pressed on it
     with pytest.raises(PolicyViolation, match="past reports"):
         everything_on.sanitize_context({"active_model": model})
     decision = decide(everything_on, "action_archive", model=model)
     assert decision.allowed is False and "accounting setup" in decision.reason
+
+
+EDITABLE_SETUP = {
+    "account.account": {"name", "tag_ids", "active"},
+    "account.tax": {"active", "name", "description", "invoice_label", "fiscal_position_ids", "original_tax_ids"},
+    "account.fiscal.position": {"name", "auto_apply", "country_id", "country_group_id", "state_ids", "zip_from",
+                                "zip_to", "vat_required", "tax_ids", "account_ids"},
+    "account.journal": {"name", "show_on_dashboard", "color", "sequence"},
+}
+UNCHANGEABLE_SETUP = {
+    "account.account": ["code", "account_type", "currency_id", "reconcile", "tax_ids", "company_ids", "non_trade"],
+    "account.tax": ["amount", "amount_type", "type_tax_use", "price_include_override", "tax_group_id",
+                    "invoice_repartition_line_ids", "refund_repartition_line_ids", "children_tax_ids", "country_id",
+                    "include_base_amount", "tax_exigibility", "cash_basis_transition_account_id"],
+    "account.fiscal.position": ["active", "foreign_vat", "company_id", "note", "sequence"],
+    "account.journal": ["type", "code", "currency_id", "default_account_id", "suspense_account_id",
+                        "profit_account_id", "loss_account_id", "alias_name", "alias_id", "active", "company_id",
+                        "refund_sequence", "payment_sequence", "inbound_payment_method_line_ids"],
+}
+
+
+@pytest.mark.parametrize("model", sorted(EDITABLE_SETUP))
+def test_existing_accounting_setup_takes_only_the_agreed_edits(model, everything_on):
+    for name in EDITABLE_SETUP[model]:
+        ftype = "many2many" if name.endswith("_ids") else "char"
+        meta = {"type": ftype, "relation": "account.tax"} if ftype == "many2many" else {"type": ftype}
+        assert everything_on.field_write_block_reason(name, meta, model=model) is None, name
+    for name in UNCHANGEABLE_SETUP[model]:
+        reason = everything_on.field_write_block_reason(name, {"type": "char"}, model=model)
+        assert reason and "past reports and GST returns" in reason and "can change only" in reason, name
+        # creating keeps its own rules: the edit list does not limit what a new record may set
+        assert everything_on.field_write_block_reason(name, {"type": "char"}, model=model, creating=True) is None, name
+
+
+def test_archiving_accounts_and_switching_taxes_still_need_the_archive_switch(rw):
+    for model in ("account.account", "account.tax"):
+        reason = rw.field_write_block_reason("active", {"type": "boolean"}, model=model)
+        assert reason and "archiving is switched off" in reason
+
+
+def test_setup_is_never_changed_through_another_record(everything_on):
+    reason = everything_on.nested_write_block_reason("product.template", "taxes_id", "account.tax", creating=False)
+    assert reason and "cannot be changed through another record" in reason
 
 
 @pytest.mark.parametrize(
@@ -1043,7 +1089,6 @@ def test_change_warnings_for_templates_rules_and_accounting_setup(rw):
 def test_change_warnings_are_empty_for_ordinary_changes_and_take_any_iterable(rw):
     assert rw.change_warnings("crm.lead", "write", ["name"]) == []
     assert rw.change_warnings("sale.order", "create", []) == []
-    assert rw.change_warnings("account.tax", "write", ["name"]) == []  # refused anyway
     assert rw.change_warnings("res.config.settings", "create", iter(["group_uom"]))
     assert rw.change_warnings("base.automation", "create", None)
 
@@ -1092,7 +1137,11 @@ def test_read_only_mode_says_what_is_off_and_what_to_do(ro):
 )
 def test_asking_to_delete_says_it_is_not_possible_and_what_to_do_instead(method):
     off = decide(policy(mcp_access_mode="read_write"), method)
-    assert off.reason == "Deleting is not possible through Claude. Delete it in Odoo."
+    assert off.reason == (
+        "Deleting is not possible through Claude's buttons. Claude can delete only draft invoices, bills or entries "
+        "that never had a number, cancelled quotations or sales orders, and archived leads, with odoo_preview_delete. "
+        "Delete anything else in Odoo."
+    )
     on = decide(policy(mcp_access_mode="read_write", mcp_allow_archive=True), method)
     assert on.allowed is False and "Archive the record instead" in on.reason and "delete it in Odoo" in on.reason
     assert "odoo_create" not in on.reason

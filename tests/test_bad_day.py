@@ -175,7 +175,7 @@ READS = frozenset(
         "default_get", "has_access", "onchange",
     }
 )
-CHANGES = frozenset({"create", "write", "action_confirm", "message_post"})
+CHANGES = frozenset({"create", "write", "action_confirm", "message_post", "unlink"})
 FAULTS = (
     "429", "429+retry-after", "500", "500-html", "502", "503", "504", "timeout", "connect", "dropped", "slow", "garbled",
 )
@@ -277,7 +277,14 @@ class BadDayOdoo:
         return httpx.Response(200, json=result)
 
     def _run(self, user: dict, model: str, method: str, body: dict):
-        assert "unlink" not in method.lower(), f"{model}.{method} reached Odoo"
+        # unlink arrives only from the delete tool, only for an archived lead (the one kind of record it deletes here)
+        assert "unlink" not in method.lower() or (method == "unlink" and model == "crm.lead"), f"{model}.{method} reached Odoo"
+        if method == "unlink":
+            leads = self.records.records["crm.lead"]
+            assert all(rid in leads and leads[rid].get("active") is False for rid in body["ids"]), body
+            for rid in body["ids"]:
+                leads.pop(rid)
+            return True
         if model == "res.users" and method == "context_get":
             return {"uid": user["id"], "tz": "Asia/Kolkata", "lang": "en_US"}
         if model == "res.users" and method == "read" and body.get("ids") == [user["id"]]:
@@ -538,8 +545,11 @@ def make_deployment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 # ================================================================================ what Claude does
 
-CHANGE_TOOLS = frozenset({"odoo_create", "odoo_update", "odoo_run_action", "odoo_add_note", "odoo_send_message"})
-CHANGE_KINDS = ("update", "create", "action", "message", "note")
+CHANGE_TOOLS = frozenset(
+    {"odoo_create", "odoo_update", "odoo_run_action", "odoo_add_note", "odoo_send_message", "odoo_delete"}
+)
+CHANGE_KINDS = ("update", "create", "action", "message", "note", "delete")
+DELETED_LEAD = 9000  # + approval number: each delete approval gets its own archived lead
 READ_LEAD = {"model": "crm.lead", "ids": [100]}
 READ_CALLS = (
     ("odoo_whoami", {}),
@@ -568,12 +578,19 @@ def change_calls(kind: str, n: int) -> tuple[tuple[str, dict] | None, tuple[str,
     if kind == "message":
         args = {"model": "crm.lead", "record_id": 100, "message": f"Quote {n} is ready"}
         return ("odoo_preview_message", args), ("odoo_send_message", args)
+    if kind == "delete":
+        args = {"model": "crm.lead", "ids": [DELETED_LEAD + n]}
+        return ("odoo_preview_delete", args), ("odoo_delete", args)
     return None, ("odoo_add_note", {"model": "crm.lead", "record_id": 100, "note": f"Called the customer ({n})"})
 
 
 def approve(env: Deployment, watch: Watch, access: str, kind: str, n: int) -> tuple[str, str, dict] | None:
     """Previews a change as the person saw and approved it: (approval, commit tool, commit arguments)."""
     preview, (tool, args) = change_calls(kind, n)
+    if kind == "delete":  # an archived lead to delete
+        env.odoo.records.records["crm.lead"].setdefault(
+            DELETED_LEAD + n, {"name": f"Lost lead {n}", "type": "lead", "active": False, "write_date": "2026-10-15 10:00:00"}
+        )
     if preview is None:
         return f"note:{n}", tool, args  # a note needs no approval; its tag tracks it at Odoo
     for _ in range(3):  # a preview is a read: Claude tries again if Odoo was busy
