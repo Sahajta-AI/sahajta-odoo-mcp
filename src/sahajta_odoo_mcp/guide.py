@@ -21,7 +21,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import Settings
-from .confirm import DEFAULT_TTL_SECONDS
 from .errors import OdooError, PolicyViolation, RateLimited, ValidationFailed
 
 # ---------------------------------------------------------------------------
@@ -194,7 +193,8 @@ TOPICS: dict[str, Topic] = {
             Can("Give you a link to each record, to open it in Odoo."),
         ),
         cannot=(
-            ("Delete anything", "deleting cannot be undone, so only a person does it, in Odoo"),
+            ("Delete anything except three kinds of leftovers (see odoo_help topic delete)",
+             "deleting cannot be undone, so only a person does it, in Odoo"),
             ("Upload, rename or delete files, or take a file shared in this chat into Odoo", _FILES_WHY),
             ("Install apps, or change users, access rights, passwords or API keys",
              "these decide who can do what, and can raise your Odoo bill"),
@@ -271,13 +271,15 @@ TOPICS: dict[str, Topic] = {
             Can("Mark a lead lost, with a reason.",
                 "odoo_preview_action model crm.lead, method \"dialog:crm.lead.lost\", dialog_values "
                 "{\"lost_reason_id\": <id from crm.lost.reason>} (and \"lost_feedback\" for a note)", ("cancel",)),
+            Can("Delete leads that are already archived (cannot be undone).", "odoo_preview_delete, then odoo_delete (one approval; it cannot be undone)",
+                ("write",)),
             Can("Bring back a lost lead.", "odoo_preview_action model crm.lead, method action_restore",
                 ("archive", "cancel")),
         ),
         cannot=(
             ("Enrich leads with company data (the Enrich button) or generate new leads",
              "they spend paid Odoo credits"),
-            ("Delete leads", "deleting cannot be undone"),
+            ("Delete leads that are still active", "deleting cannot be undone; archive the lead first"),
         ),
         yourself=_steps(
             "Your pipeline: {menu:crm.menu_crm_opportunities}.",
@@ -315,20 +317,23 @@ TOPICS: dict[str, Topic] = {
             Can("Cancel an order, or set it back to quotation.",
                 "odoo_preview_action model sale.order, method action_cancel or action_draft; if Odoo opens a "
                 "window, follow the next_step it returns", ("cancel",)),
+            Can("Remove lines from a quotation (not yet confirmed). The preview lists each line it removes.",
+                "odoo_preview_update model sale.order with order_line [[2, line_id, 0]]", ("write",)),
+            Can("Delete cancelled quotations (cannot be undone).", "odoo_preview_delete, then odoo_delete (one approval; it cannot be undone)", ("write",)),
             Can("E-mail the quotation with its PDF to the customer, in one approval. The preview shows the "
                 "recipients, subject and attachment; Odoo then marks the quotation as sent.",
                 "odoo_preview_action model sale.order (one quotation), method action_quotation_send", ("outbound",)),
         ),
         cannot=(
-            ("Remove lines from an order", "removing a line deletes it"),
+            ("Remove lines from a confirmed order", "set the line's quantity to 0 instead"),
             ("Capture or void online card payments", "payment providers move real money"),
-            ("Delete quotations", "deleting cannot be undone"),
+            ("Delete quotations that are not cancelled", "deleting cannot be undone; cancel it first"),
         ),
         yourself=_steps(
             "Quotations: {menu:sale.menu_sale_quotations}.",
             Step("Send the quotation: open it, click Send, check the e-mail, click Send.", unless="outbound"),
             "Download the PDF: open it and click Print.",
-            "Remove a line: open the quotation, click the bin icon on the line, save.",
+            "Confirmed order: set the line's quantity to 0 instead of removing it.",
             Step("Cancel: open the order and click Cancel. Back to quotation: click Set to Quotation.", unless="cancel"),
         ),
         needs=(
@@ -366,11 +371,16 @@ TOPICS: dict[str, Topic] = {
                 "\"...\"}; then action_post on the credit note", ("cancel",)),
             Can("Reset a posted invoice to draft, or cancel a draft.",
                 "odoo_preview_action model account.move, method button_draft or button_cancel", ("cancel",)),
+            Can("Remove lines from a draft invoice. The preview lists each line it removes.",
+                "odoo_preview_update model account.move with invoice_line_ids [[2, line_id, 0]]", ("write",)),
+            Can("Delete a draft invoice that never had a number (cannot be undone).", "odoo_preview_delete, then odoo_delete (one approval; it cannot be undone)",
+                ("write",)),
         ),
         cannot=(
             ("Give you the invoice PDF in this chat", _FILES_WHY),
             ("Lock posted entries (the Lock button)", "locking cannot be undone"),
-            ("Delete invoices", "deleting cannot be undone; Odoo itself never deletes posted invoices"),
+            ("Delete invoices that are posted or ever had a number", "deleting cannot be undone; cancel instead"),
+            ("Remove lines from a posted invoice", "reset it to draft first, then remove the line"),
         ),
         yourself=_steps(
             "Invoices: {menu:account.menu_action_move_out_invoice_type}.",
@@ -412,12 +422,15 @@ TOPICS: dict[str, Topic] = {
                 "different bills in one preview with changes. Then name the emptied draft bills for the person "
                 "to delete in Odoo", ("write",)),
             Can("Confirm (post) a bill.", "odoo_preview_action model account.move, method action_post", ("write",)),
+            Can("Remove lines from a draft bill, or delete a draft bill that never had a number, for example an "
+                "empty one left after moving its PDF (deleting cannot be undone).",
+                "odoo_preview_update with invoice_line_ids [[2, line_id, 0]]; odoo_preview_delete, then odoo_delete (one approval; it cannot be undone)", ("write",)),
         ),
         cannot=(
             ("Take a PDF shared in this chat into Odoo", _FILES_WHY),
             ("Upload a bill PDF in Odoo", _FILES_WHY),
             ("Move files off a posted bill, or move PDFs Odoo made itself", "posted entries keep their documents"),
-            ("Delete draft bills", "deleting cannot be undone"),
+            ("Delete bills that are posted or ever had a number", "deleting cannot be undone; cancel instead"),
         ),
         yourself=_steps(
             "Bill inbox: forward each vendor PDF as its own e-mail to {bill_inbox}. Odoo makes one draft bill per "
@@ -710,13 +723,26 @@ TOPICS: dict[str, Topic] = {
                 "every future entry uses it.",
                 "odoo_preview_create model account.account, account.tax, account.fiscal.position or account.journal",
                 ("write",)),
+            Can("Rename an existing account, change its tags (for the cash flow report), or archive it if it has "
+                "no entries.", "odoo_preview_update model account.account with name, tag_ids or active", ("write",)),
+            Can("Switch an existing tax on or off, or change its name, description or invoice label. For example "
+                "switch on the reverse-charge taxes once your CA confirms. Only new documents are affected.",
+                "odoo_preview_update model account.tax with active, name, description or invoice_label", ("write",)),
+            Can("Change a fiscal position: its name, when it applies automatically (country, states, GST number), "
+                "and which taxes and accounts it replaces. Only new documents are affected.",
+                "odoo_preview_update model account.fiscal.position", ("write",)),
+            Can("Rename a journal, or change its colour, order or whether it shows on the dashboard.",
+                "odoo_preview_update model account.journal with name, color, sequence or show_on_dashboard",
+                ("write",)),
             Can("Split invoice and bill lines across analytic accounts.",
                 "line value \"analytic_distribution\": {\"<analytic account id>\": percent} (above 0, up to 100)",
                 ("write",)),
         ),
         cannot=(
-            ("Change or archive existing accounts, taxes, fiscal positions or journals",
-             "entries already use them, so a change alters past reports and GST returns"),
+            ("Change an existing account's code, type or currency; a tax's rate, accounts or lines; a journal's "
+             "type, short code, currency or accounts", "entries already use them, so a change alters past reports "
+             "and GST returns"),
+            ("Archive an account that has entries", "its entries would point to a hidden account"),
             ("Bank details on journals", _BANK_WHY),
             ("Lock dates", "they close a period for everyone"),
             ("Report layouts, payment methods, rounding", "they change every report"),
@@ -769,13 +795,16 @@ TOPICS: dict[str, Topic] = {
         summary="Deleting records",
         can=(
             Can("Find the records to delete and give you their links."),
+            Can("Delete three kinds of leftovers, after you approve the list: draft invoices or bills that never had a "
+                "number, cancelled quotations, and leads already archived. It cannot be undone.",
+                "odoo_preview_delete, then odoo_delete (one approval; it cannot be undone)", ("write",)),
             Can("Archive instead: the record is hidden and can be brought back.",
                 "odoo_preview_update values {\"active\": false}", ("archive",)),
             Can("Cancel a document instead (quotation, invoice, bill).", "its Cancel button (odoo_list_actions)",
                 ("cancel",)),
         ),
         cannot=(
-            ("Delete anything: records, lines, files, messages",
+            ("Delete anything else: contacts, products, posted or confirmed documents, files, messages, setup",
              "deleting cannot be undone, so only a person does it, in Odoo"),
         ),
         yourself=_steps(
@@ -866,11 +895,13 @@ TOPICS: dict[str, Topic] = {
         can=(
             Can("Read up to {max_read} records in one search ({default_read} unless asked for more), and tell you "
                 "when there are more."),
-            Can("Change up to {max_write} records in one approval.", "", ("write",)),
+            Can("Create or change up to {max_write} records in one approval; press a button, send, change followers "
+                "or delete on up to {max_action} records in one approval.", "", ("write",)),
             Can("{approval_rule}", "", ("write",)),
         ),
         cannot=(
-            ("Change more than {max_write} records in one approval", "it limits the harm one mistake can do"),
+            ("Change more than {max_write} records, or press a button or delete on more than {max_action}, in one "
+             "approval", "it limits the harm one mistake can do"),
             ("Use an approval twice, or after {approval_minutes} minutes", "each approval is for one change, now"),
             ("Go faster than {reads_per_minute} reads and {writes_per_minute} changes a minute per person",
              "{pace_reason}"),
@@ -964,9 +995,10 @@ class _Writer:
             "max_read": str(s.mcp_max_read_records),
             "default_read": str(s.mcp_default_read_limit),
             "max_write": str(s.mcp_max_write_records),
+            "max_action": str(s.mcp_max_action_records),
             "reads_per_minute": str(s.mcp_reads_per_minute),
             "writes_per_minute": str(s.mcp_writes_per_minute),
-            "approval_minutes": str(DEFAULT_TTL_SECONDS // 60),
+            "approval_minutes": str(s.mcp_confirm_ttl_seconds // 60),
             "pace_reason": (
                 "it keeps runaway loops in check, and Odoo is asked one thing at a time (Odoo Online's fair-use rule)"
                 if s.odoo_max_parallel_requests == 1 else "it keeps runaway loops in check"

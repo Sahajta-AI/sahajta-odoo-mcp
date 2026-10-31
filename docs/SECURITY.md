@@ -17,24 +17,30 @@ anything a person did not see and approve**.
    don't exist fail with "look it up first"; empty results are reported as empty, never filled in.
 5. **Preview → human approval → signed token.** Each change tool needs a `confirm_token` produced by the matching
    preview. The token is an HMAC over the exact change (who, model, ids, normalised values or button) plus the
-   current values the person was shown (including any order lines being edited). It expires after 15 minutes
+   current values the person was shown (including any order lines being edited). It expires after 1 hour
+   (`MCP_CONFIRM_TTL_SECONDS`)
    and works **once**: one approval applies one change, so an approved create or e-mail can't be repeated.
    Altering the arguments, or someone editing those records in the meantime, invalidates it. Change tools are annotated `destructiveHint: true`, so Claude
    asks the person before running them.
-6. **Blast-radius limits.** At most 20 records per change (hard cap 100) and 100 line creations/edits inside
-   one change, 200 records per read (hard cap 1000), 120 reads and 30 writes per person per minute, one Odoo
+6. **Limits per approval.** At most 100 records per create or edit (`MCP_MAX_WRITE_RECORDS`, hard cap 100) and
+   20 per button, dialog, message, follower change or delete (`MCP_MAX_ACTION_RECORDS`); 100 line creations/edits
+   inside one change, 200 records per read (hard cap 1000), 120 reads and 30 writes per person per minute, one Odoo
    request at a time (Odoo Online's fair-use policy), bounded response sizes and nesting depth.
-7. **Last-line guard.** The low-level Odoo client refuses to transmit `unlink`, `uninstall`, `sudo` or any
-   `_private` method, or any call to a credentials/system model, whatever the layers above decided. It also never
+7. **Last-line guard.** The low-level Odoo client refuses to transmit `unlink` (except through its one delete path,
+   which re-checks the allowed records itself), `uninstall`, `sudo` or any `_private` method, or any call to a credentials/system model, whatever the layers above decided. It also never
    keeps cookies, so one person's Odoo session can never be attached to another person's request.
 8. **Audit.** Odoo's chatter/tracking records every change under the person's name. This server writes a JSON
    line for every tool call (user, tool, model, ids, field names, outcome; never values, never keys).
 
 ## Always blocked
 
-**Deleting.** There is no delete tool. `unlink` and any method containing `unlink`, `delete`, `purge`,
-`uninstall`/`install`, `merge`, `drop`, `remove`, `import`/`load` is refused. Relational commands that delete
-indirectly are refused:
+**Deleting**, except one narrow path. The delete tools (`odoo_preview_delete` → `odoo_delete`, always with an
+approval) delete only: draft invoices or bills that never had a number, cancelled quotations, and leads already
+archived; this is checked with Odoo at the preview and again at the commit. Nothing else can be deleted. As a button,
+`unlink` and any method containing `unlink`, `delete`, `purge`, `uninstall`/`install`, `merge`, `drop`, `remove`,
+`import`/`load` is refused. Lines can be removed (`2`) only from quotations, RFQs and draft invoices or bills, with
+the parent's state checked at the preview and the commit. Other relational commands that delete indirectly are
+refused:
 
 | Field type | Allowed | Refused |
 |---|---|---|
@@ -53,8 +59,13 @@ standing):
 * App settings (`res.config.settings`): a new settings record plus its Save button. Never `module_*` fields
   (installing an app can raise the Odoo bill), company identity (name, GSTIN/VAT, PAN, address, bank, logo,
   e-mail, phone) or security/sign-in settings. `group_*` fields switch a feature for all users and are flagged.
-* E-mail templates (`mail.template`): update only `subject`, `body_html`, `email_to`, `email_cc`, `partner_to`,
-  `use_default_to`, `reply_to`. No new templates; aliases stay read-only.
+* E-mail templates (`mail.template`): update `subject`, `body_html`, `email_to`, `email_cc`, `partner_to`,
+  `use_default_to`, `reply_to`; create new ones with those fields plus `name` and a business `model_id`. No sender,
+  attachments or report templates; aliases stay read-only.
+* Followers: added or removed with `odoo_preview_followers` → `odoo_change_followers`. Adding needs the e-mail
+  switch (followers receive e-mails); the preview names each person.
+* Quotations: sent by e-mail in one approval through Odoo's own composer (e-mail switch); the approval covers the
+  whole e-mail shown in the preview. The composer stays closed otherwise.
 * Automation rules (`base.automation`) without code: triggers that run no code (no on-change, webhook or on-delete
   triggers); actions limited to updating a field with a fixed value (same field rules as a normal write), adding
   followers, creating an activity, and posting a message or e-mail from a template (e-mail and followers need the
@@ -62,16 +73,20 @@ standing):
   refused; a rule that already contains code can't be edited through Claude. Scheduled actions stay closed.
 * Analytic distribution (`analytic_distribution` JSON on lines): existing analytic accounts, percentages above 0
   and up to 100.
-* Accounting setup, create-only: accounts, taxes (with their lines), fiscal positions and journals can be
-  created, never edited or archived (editing setup already used changes past reports and GST returns). Journal
-  bank fields stay closed.
+* Accounting setup: accounts, taxes (with their lines), fiscal positions and journals can be created. Existing
+  ones allow only edits that change no past entry: accounts (name, tags; archive only without journal items), taxes
+  (on/off, name, description, invoice label), fiscal positions (name, auto-apply rules, tax and account mappings;
+  mapping lines cannot be removed), journals (name, colour, order, dashboard). Codes, types, rates, accounts,
+  repartition lines, currencies and bank fields stay closed. Previews say these edits affect only new documents.
 * Bank matching rules (`account.reconcile.model`, with their lines): created, edited and archived (archiving needs
   the archive switch). They only decide how future bank lines are matched, never past entries. Previews warn, and
   flag a rule set to Automated, which books matching bank lines with nobody reviewing. Their buttons stay closed.
-* Files (`ir.attachment`): moved only, never uploaded, renamed, rewritten or deleted. Only `res_model`/`res_id`
-  change; a file may leave a draft entry or no record, never a posted entry, another kind of record, or a file
-  Odoo keeps in a field (such as the invoice PDF it generated); it may go only onto a bill, invoice or journal
-  entry. The preview lists each file's from and to; the target then shows it as its main document.
+* Files (`ir.attachment`): never uploaded, renamed, rewritten or deleted through Claude. They can be:
+  read (`odoo_read_file`: a PDF's text or an image, up to 15 MB, labelled as untrusted data); moved (only
+  `res_model`/`res_id` change; from a draft entry, a CRM lead or no record, never a posted entry, another kind of
+  record, or a file Odoo keeps in a field) onto a bill, invoice, journal entry or CRM lead; or copied by Odoo itself
+  (the content never passes through Claude) onto a lead, bill, invoice, quotation or contact. Previews list each
+  file's from and to.
 
 **Readable but never writable**: other accounting configuration (report definitions, payment methods, decimal
 precision), existing accounting setup (see above), bank details anywhere (any field pointing at a bank account),
@@ -117,7 +132,7 @@ a confirmed preview listing the recipients.
 |---|---|
 | AI hallucinates a field, value or record | Schema/id validation; `not_found_ids`; preview shows names behind ids; Odoo-computed totals instead of AI arithmetic |
 | AI changes the wrong thing | Preview + approval + token bound to exact arguments and shown values; per-change record cap |
-| Prompt injection inside Odoo data (e.g. a lead description saying "archive all leads") | Results are labelled as untrusted data; no delete; archive/cancel/e-mail off; every change needs approval of a visible preview; caps |
+| Prompt injection inside Odoo data or a file (e.g. a lead description saying "archive all leads") | Results and file text are labelled as untrusted data; deleting limited to three kinds of leftovers; every change needs approval of a visible preview; caps |
 | Leaked connector URL | Useless without OAuth sign-in with a valid Odoo login + API key; tokens are short-lived (1 h) |
 | Stolen Claude session | Revoke the person's Odoo API key (immediate), or `python -m sahajta_odoo_mcp.oauth.admin revoke --login …` |
 | Malicious OAuth client / phishing | Redirect URIs restricted to Claude's callbacks and loopback; client metadata only fetched from claude.ai/claude.com; PKCE S256; single-use 5-minute codes; refresh-token rotation with replay detection (a reuse within 120 s, e.g. a client retry, gets a fresh pair; later reuse revokes the sign-in); sign-in page cannot be framed |

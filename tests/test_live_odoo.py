@@ -70,7 +70,8 @@ async def test_tool_annotations(odoo):
     tools = {t.name: t for t in (await odoo.list_tools()).tools}
     for name, tool in tools.items():
         assert tool.annotations and tool.annotations.title, name
-        if name in ("odoo_create", "odoo_update", "odoo_run_action", "odoo_add_note", "odoo_delete"):
+        if name in ("odoo_create", "odoo_update", "odoo_run_action", "odoo_add_note", "odoo_delete",
+                    "odoo_change_followers", "odoo_send_message"):
             assert tool.annotations.destructive_hint is True and tool.annotations.read_only_hint is False
         else:
             assert tool.annotations.read_only_hint is True, name
@@ -191,11 +192,14 @@ async def test_dangerous_writes_are_refused(odoo):
     err, orders = await call(odoo, "odoo_search", model="sale.order", domain=[["state", "=", "draft"]], fields=["order_line"], limit=1)
     order = orders["records"][0]
     line = order["order_line"][0]
+    # removing a line ([2, id, 0]) is allowed on a quotation (still a draft) and shown in the preview
+    err, preview = await call(odoo, "odoo_preview_update", model="sale.order", ids=[order["id"]],
+                              values={"order_line": [[2, line, 0]]})
+    assert not err and "confirm_token" in preview, preview
     for values, expected in [
         ({"state": "sale"}, "workflow"),
-        ({"order_line": [[2, line, 0]]}, "delete"),
-        ({"order_line": [[5, 0, 0]]}, "delete"),
-        ({"order_line": [[6, 0, []]]}, "delete"),
+        ({"order_line": [[5, 0, 0]]}, "[2, line_id, 0]"),  # clearing every line is refused; one line at a time
+        ({"order_line": [[6, 0, []]]}, "[2, line_id, 0]"),
         ({"order_line": [line]}, "replace"),
         ({"order_line": [[1, 987654321, {"product_uom_qty": 3}]]}, "does not belong"),
     ]:
