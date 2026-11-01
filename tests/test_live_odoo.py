@@ -71,7 +71,8 @@ async def test_tool_annotations(odoo):
     for name, tool in tools.items():
         assert tool.annotations and tool.annotations.title, name
         if name in ("odoo_create", "odoo_update", "odoo_run_action", "odoo_add_note", "odoo_delete",
-                    "odoo_change_followers", "odoo_send_message"):
+                    "odoo_change_followers", "odoo_send_message", "odoo_bank_match", "odoo_bank_unmatch",
+                    "odoo_lock_date", "odoo_fix_posted_bill"):
             assert tool.annotations.destructive_hint is True and tool.annotations.read_only_hint is False
         else:
             assert tool.annotations.read_only_hint is True, name

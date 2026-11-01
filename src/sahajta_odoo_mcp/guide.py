@@ -422,6 +422,12 @@ TOPICS: dict[str, Topic] = {
                 "different bills in one preview with changes. Then name the emptied draft bills for the person "
                 "to delete in Odoo", ("write",)),
             Can("Confirm (post) a bill.", "odoo_preview_action model account.move, method action_post", ("write",)),
+            Can("Correct a posted bill in one approval: reset it to draft, change its lines, post it again (it keeps "
+                "its number) and, if it was paid through a bank line, match that line again. Claude stops at the "
+                "first step that fails and says where the bill is.",
+                "odoo_preview_fix_posted_bill with move_id, line_changes [[1, line_id, {\"price_unit\": 900}]], "
+                "rematch_statement_line_id, and acknowledge_paid true once the person knows it is paid; then "
+                "odoo_fix_posted_bill", ("cancel",)),
             Can("Remove lines from a draft bill, or delete a draft bill that never had a number, for example an "
                 "empty one left after moving its PDF (deleting cannot be undone).",
                 "odoo_preview_update with invoice_line_ids [[2, line_id, 0]]; odoo_preview_delete, then odoo_delete (one approval; it cannot be undone)", ("write",)),
@@ -431,6 +437,8 @@ TOPICS: dict[str, Topic] = {
             ("Upload a bill PDF in Odoo", _FILES_WHY),
             ("Move files off a posted bill, or move PDFs Odoo made itself", "posted entries keep their documents"),
             ("Delete bills that are posted or ever had a number", "deleting cannot be undone; cancel instead"),
+            ("Correct a posted bill dated in a locked period",
+             "that period is closed; make a credit note and a new bill instead"),
         ),
         yourself=_steps(
             "Bill inbox: forward each vendor PDF as its own e-mail to {bill_inbox}. Odoo makes one draft bill per "
@@ -509,10 +517,24 @@ TOPICS: dict[str, Topic] = {
         can=(
             Can("Find bank lines not yet matched.",
                 "odoo_search model account.bank.statement.line with is_reconciled = false"),
-            Can("Find the open bill or invoice for each line: same amount, and the same partner or reference.",
-                "odoo_search model account.move, state posted, payment_state not_paid or partial"),
-            Can("Prepare the matching: set the partner on bank lines so Odoo's bank screen suggests the right bill "
-                "or invoice. Then tell you which pairs to confirm there.",
+            Can("Find the open bills, invoices and items Odoo's bank screen would offer for a line: same amount, or "
+                "same partner.",
+                "odoo_bank_match_candidates with statement_line_id"),
+            Can("Match a bank line with one or more bills or invoices, all of each or part of it, in one approval. "
+                "The preview shows each item's open amount, the amount matched, its new status (paid or partly "
+                "paid), what stays unmatched, and a clear warning when an item is for another partner.",
+                "odoo_preview_bank_match with statement_line_id and items [{\"move_id\": <bill or invoice id>}] or "
+                "[{\"move_line_id\": <journal item id>, \"amount\": 500}], then odoo_bank_match", ("write",)),
+            Can("Book a bank line to an account instead, for example bank charges, with a label.",
+                "odoo_preview_bank_match with statement_line_id, account_id and label, then odoo_bank_match",
+                ("write",)),
+            Can("Undo a bank line's match: what it paid goes back to unpaid. Refused when payments are linked to "
+                "the line, because Odoo would remove them.",
+                "odoo_preview_bank_unmatch with statement_line_id, then odoo_bank_unmatch", ("cancel",)),
+            Can("Correct a posted bill that is matched with a bank line, and match them again, in one approval.",
+                "odoo_preview_fix_posted_bill with rematch_statement_line_id (odoo_help topic vendor_bills)",
+                ("cancel",)),
+            Can("Set the partner on bank lines so Odoo's bank screen suggests the right bill or invoice.",
                 "one odoo_preview_update model account.bank.statement.line with changes [{\"ids\": [line], "
                 "\"values\": {\"partner_id\": id}}, ...]", ("write",)),
             Can("Create or edit bank matching rules (for example, book bank charges to an expense account). A rule "
@@ -523,14 +545,19 @@ TOPICS: dict[str, Topic] = {
                 "{\"active\": false}", ("archive",)),
         ),
         cannot=(
-            ("Match a bank line with a bill or invoice, or undo a match",
-             "matching happens in Odoo's bank screen, where you see both sides before you confirm"),
+            ("Undo a match when payments are linked to the bank line",
+             "Odoo would remove those payments for good; in the bank screen you see them first"),
+            ("Add to a line that is already partly matched, or match lines in a foreign currency",
+             "the bank screen shows both sides and the exchange difference before you confirm"),
+            ("Match a bank line in a locked period", "a locked period is closed for everyone"),
             ("Connect or change bank feeds (bank sync)", "they hold your bank connection"),
             ("Change bank account details on a journal", _BANK_WHY),
         ),
         yourself=_steps(
-            "Matching and undoing a match happen in Odoo's bank screen: {menu:account.menu_board_journal_1}, open "
+            "Matching and undoing a match in Odoo's bank screen: {menu:account.menu_board_journal_1}, open "
             "the Bank card.",
+            Step("Undo a match: in the bank screen, open the matched line and undo its matching there.",
+                 unless="cancel"),
             "Bank matching rules are managed from that bank matching screen.",
             "Bank feeds and bank account details are set in Odoo by your Odoo administrator.",
         ),
@@ -737,6 +764,10 @@ TOPICS: dict[str, Topic] = {
             Can("Split invoice and bill lines across analytic accounts.",
                 "line value \"analytic_distribution\": {\"<analytic account id>\": percent} (above 0, up to 100)",
                 ("write",)),
+            Can("Show the five lock dates (global, tax return, sales, purchase, hard).", "odoo_whoami, lock_dates"),
+            Can("Move the tax return lock date forward, up to today, once the GST return for that period is filed. "
+                "The preview says what locking means and how many posted and draft entries with taxes it freezes.",
+                "odoo_preview_lock_date with tax_lock_date \"YYYY-MM-DD\", then odoo_lock_date", ("write",)),
         ),
         cannot=(
             ("Change an existing account's code, type or currency; a tax's rate, accounts or lines; a journal's "
@@ -744,7 +775,8 @@ TOPICS: dict[str, Topic] = {
              "and GST returns"),
             ("Archive an account that has entries", "its entries would point to a hidden account"),
             ("Bank details on journals", _BANK_WHY),
-            ("Lock dates", "they close a period for everyone"),
+            ("Move any lock date back, or change the global, sales, purchase or hard lock date",
+             "they close a period for everyone, and the hard lock date can never be moved back"),
             ("Report layouts, payment methods, rounding", "they change every report"),
         ),
         yourself=_steps(
@@ -906,7 +938,11 @@ TOPICS: dict[str, Topic] = {
             Can("Read up to {max_read} records in one search ({default_read} unless asked for more), and tell you "
                 "when there are more."),
             Can("Create or change up to {max_write} records in one approval; press a button, send, change followers "
-                "or delete on up to {max_action} records in one approval.", "", ("write",)),
+                "or delete on up to {max_action} records in one approval, and match one bank line with up to "
+                "{max_action} items.", "", ("write",)),
+            Can("Run a planned set of steps under one approval (matching a bank line with part amounts, correcting a "
+                "posted bill). Each step is sent once, in order; Claude stops at the first that fails and says "
+                "where it stopped and what Odoo shows then. Nothing is retried on its own.", "", ("write",)),
             Can("{approval_rule}", "", ("write",)),
         ),
         cannot=(

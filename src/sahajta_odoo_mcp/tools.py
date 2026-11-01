@@ -73,6 +73,8 @@ own steps are in odoo_help):
   (one at a time) with action_invoice_sent. Credit note: action_reverse with dialog_values {"reason": "..."}; it
   makes a draft credit note to post with action_post.
 - Lead lost: crm.lead "dialog:crm.lead.lost" with dialog_values {"lost_reason_id": <id from crm.lost.reason>}.
+- Bank line: odoo_bank_match_candidates, then odoo_preview_bank_match; undo with odoo_preview_bank_unmatch. Tax
+  lock date forward: odoo_preview_lock_date. Fix a posted bill: odoo_preview_fix_posted_bill (one approval).
 - Vendor bills and the bill inbox, PDFs and other files, bank matching: odoo_help topics vendor_bills, files, bank.
 - Official accounting reports (P&L, balance sheet, trial balance, ledgers, ageing, tax/GST) for a period:
   odoo_report; ledgers one account or partner at a time.
@@ -138,6 +140,39 @@ Changes = Annotated[
 PartnerIds = Annotated[
     list[int] | None, Field(description="Contact ids (res.partner) taken from search results. Never invent ids.")
 ]
+StatementLine = Annotated[
+    int, Field(description="Id of the bank line (account.bank.statement.line), from search results. Never invent ids.")
+]
+BankItems = Annotated[
+    list[dict[str, Any]] | None,
+    Field(
+        description="What the bank line pays or receives, in order: [{\"move_id\": <invoice or bill id>}] or "
+        "[{\"move_line_id\": <journal item id>}], each with an optional \"amount\" to match only part of it. Leave "
+        "out when booking the line to an account."
+    ),
+]
+BankAccount = Annotated[
+    int | None,
+    Field(description="Instead of items: the account (account.account) to book the whole bank line to, e.g. bank charges."),
+]
+BankLabel = Annotated[str | None, Field(description="With account_id only: the label of the booked line.")]
+LineChanges = Annotated[
+    list[Any],
+    Field(
+        description="Changes to the bill's lines: [1, line_id, {\"price_unit\": 900}] to edit a line, "
+        "{\"name\": ..., \"price_unit\": ..., \"account_id\": ...} to add one. Lines cannot be removed here "
+        "(set the quantity to 0)."
+    ),
+]
+Rematch = Annotated[
+    int | None,
+    Field(description="The bank line (account.bank.statement.line) to match with the bill again after it is posted, "
+          "if Odoo removed the match."),
+]
+AcknowledgePaid = Annotated[
+    bool, Field(description="Set to true only after telling the person the bill is already paid or sent.")
+]
+TaxLockDate = Annotated[str, Field(description="The new tax return lock date, YYYY-MM-DD: later than the current one, at most today.")]
 DialogValues = Annotated[
     dict[str, Any] | None,
     Field(
@@ -323,6 +358,15 @@ def register_tools(
             blocks.append(ImageContent(type="image", data=image["data"], mime_type=image["mime_type"]))
         return blocks
 
+    @mcp.tool(title="Find what a bank line pays", annotations=ToolAnnotations(title="Find what a bank line pays", **_READ), structured_output=False)
+    async def odoo_bank_match_candidates(
+        statement_line_id: StatementLine,
+        limit: Annotated[int | None, Field(description="Max items per list (default 10).")] = None,
+    ) -> str:
+        """For one bank line: the open invoices, bills and journal items Odoo's bank screen would offer to match it
+        with, those with the same amount and those of the same partner. Changes nothing."""
+        return await run(lambda s: s.bank_match_candidates(statement_line_id, limit), model="account.bank.statement.line")
+
     if not settings.read_write:
         return
 
@@ -423,6 +467,82 @@ def register_tools(
         previewed arguments plus its confirm_token. Returns each record's followers as Odoo now has them."""
         return await run(
             lambda s: s.change_followers(model, ids, add_partner_ids, remove_partner_ids, confirm_token), model=model
+        )
+
+    # ------------------------------------------------------------------ accounting steps (accounting.py)
+
+    bank_model, bill_model = "account.bank.statement.line", "account.move"
+
+    @mcp.tool(title="Preview matching a bank line", annotations=preview("Preview matching a bank line"), structured_output=False)
+    async def odoo_preview_bank_match(
+        statement_line_id: StatementLine, items: BankItems = None, account_id: BankAccount = None, label: BankLabel = None
+    ) -> str:
+        """Show what matching one bank line would do, WITHOUT changing anything: the bank line, each item with its
+        open amount, the amount matched and its new status, what stays unmatched, and warnings (another partner).
+        Give items (invoices, bills, journal items) or account_id. Returns a confirm_token for odoo_bank_match."""
+        return await run(lambda s: s.preview_bank_match(statement_line_id, items, account_id, label), model=bank_model)
+
+    @mcp.tool(title="Match a bank line", annotations=change("Match a bank line"), structured_output=False)
+    async def odoo_bank_match(
+        statement_line_id: StatementLine, items: BankItems = None, account_id: BankAccount = None,
+        label: BankLabel = None, confirm_token: ConfirmToken = None,
+    ) -> str:
+        """Match a bank line as Odoo's bank screen does, after the person approved the odoo_preview_bank_match
+        result. Pass exactly the previewed arguments plus its confirm_token."""
+        return await run(
+            lambda s: s.bank_match(statement_line_id, items, account_id, label, confirm_token), model=bank_model
+        )
+
+    @mcp.tool(title="Preview undoing a bank match", annotations=preview("Preview undoing a bank match"), structured_output=False)
+    async def odoo_preview_bank_unmatch(statement_line_id: StatementLine) -> str:
+        """Show what undoing a bank line's match would do (what goes back to unpaid), WITHOUT changing anything.
+        Refused when payments are linked to the line. Returns a confirm_token for odoo_bank_unmatch."""
+        return await run(lambda s: s.preview_bank_unmatch(statement_line_id), model=bank_model)
+
+    @mcp.tool(title="Undo a bank match", annotations=change("Undo a bank match"), structured_output=False)
+    async def odoo_bank_unmatch(statement_line_id: StatementLine, confirm_token: ConfirmToken = None) -> str:
+        """Undo a bank line's match, after the person approved the odoo_preview_bank_unmatch result."""
+        return await run(lambda s: s.bank_unmatch(statement_line_id, confirm_token), model=bank_model)
+
+    @mcp.tool(title="Preview the tax lock date", annotations=preview("Preview the tax lock date"), structured_output=False)
+    async def odoo_preview_lock_date(tax_lock_date: TaxLockDate) -> str:
+        """Show the five lock dates, what moving the tax return lock date forward means and how many entries with
+        taxes it freezes, WITHOUT changing anything. Only the tax lock date, only later. Returns a confirm_token."""
+        return await run(lambda s: s.preview_lock_date(tax_lock_date), model="account.change.lock.date")
+
+    @mcp.tool(title="Move the tax lock date", annotations=change("Move the tax lock date"), structured_output=False)
+    async def odoo_lock_date(tax_lock_date: TaxLockDate, confirm_token: ConfirmToken = None) -> str:
+        """Move the tax return lock date forward, after the person approved the odoo_preview_lock_date result."""
+        return await run(lambda s: s.lock_date(tax_lock_date, confirm_token), model="account.change.lock.date")
+
+    @mcp.tool(title="Preview correcting a posted bill", annotations=preview("Preview correcting a posted bill"), structured_output=False)
+    async def odoo_preview_fix_posted_bill(
+        move_id: Annotated[int, Field(description="Id of the posted vendor bill (account.move).")],
+        line_changes: LineChanges,
+        rematch_statement_line_id: Rematch = None,
+        acknowledge_paid: AcknowledgePaid = False,
+    ) -> str:
+        """Show every step of correcting a posted vendor bill (reset to draft, change lines, post again, match its
+        bank line again), WITHOUT changing anything. Refused in a locked period (make a credit note). Returns a
+        confirm_token for odoo_fix_posted_bill."""
+        return await run(
+            lambda s: s.preview_fix_posted_bill(move_id, line_changes, rematch_statement_line_id, acknowledge_paid),
+            model=bill_model,
+        )
+
+    @mcp.tool(title="Correct a posted bill", annotations=change("Correct a posted bill"), structured_output=False)
+    async def odoo_fix_posted_bill(
+        move_id: Annotated[int, Field(description="Id of the posted vendor bill (account.move).")],
+        line_changes: LineChanges,
+        rematch_statement_line_id: Rematch = None,
+        acknowledge_paid: AcknowledgePaid = False,
+        confirm_token: ConfirmToken = None,
+    ) -> str:
+        """Run the steps of odoo_preview_fix_posted_bill one by one, after the person approved them. Stops at the
+        first step that fails and says where the bill and bank line are then."""
+        return await run(
+            lambda s: s.fix_posted_bill(move_id, line_changes, rematch_statement_line_id, acknowledge_paid, confirm_token),
+            model=bill_model,
         )
 
     if not settings.mcp_allow_outbound_messages:

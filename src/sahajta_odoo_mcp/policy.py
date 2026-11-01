@@ -492,6 +492,31 @@ HARD_BLOCKED_METHODS: frozenset[str] = frozenset(
     }
 )
 
+# Buttons of Odoo's bank screen and lock date dialog that only their own tool presses, with its own checks and
+# preview (accounting.py); never as a generic button. Undoing a match also deletes payments linked to the bank line.
+DEDICATED_BUTTONS: dict[tuple[str, str], str] = {
+    ("account.bank.statement.line", "set_line_bank_statement_line"): "odoo_preview_bank_match",
+    ("account.bank.statement.line", "set_account_bank_statement_line"): "odoo_preview_bank_match",
+    ("account.bank.statement.line", "edit_reconcile_line"): "odoo_preview_bank_match",
+    ("account.bank.statement.line", "action_undo_reconciliation"): "odoo_preview_bank_unmatch",
+    ("account.bank.statement.line", "action_unreconcile_entry"): "odoo_preview_bank_unmatch",
+    ("account.change.lock.date", "change_lock_date"): "odoo_preview_lock_date",
+}
+
+
+def dedicated_button_reason(model: str, method: str) -> str | None:
+    """Why a button may be pressed only through its own tool (and which), or None."""
+    tool = DEDICATED_BUTTONS.get((model, method))
+    if tool is None and model == "account.bank.statement.line" and "reconcil" in method.lower():
+        tool = "odoo_preview_bank_match or odoo_preview_bank_unmatch"
+    if tool is None:
+        return None
+    return (
+        f"'{method}' is done only through {tool}, which shows what Odoo will do first and checks it with Odoo; it is "
+        "never pressed as a plain button"
+    )
+
+
 ARCHIVE_METHODS: frozenset[str] = frozenset({"toggle_active", "action_archive", "action_unarchive"})
 
 CANCEL_METHOD_PARTS: tuple[str, ...] = (
@@ -755,6 +780,9 @@ class SafetyPolicy:
         label_low = (label or "").lower()
         if not re.fullmatch(r"[a-z][a-z0-9_]*", low):
             return MethodDecision(False, "private or invalid method name")
+        dedicated = dedicated_button_reason(model, method)
+        if dedicated:
+            return MethodDecision(False, dedicated)
         if model in LIMITED_BUTTONS:
             if method not in LIMITED_BUTTONS[model]:
                 if any(part in low for part in _DELETE_PARTS):
