@@ -554,6 +554,14 @@ class FakeOdoo:
             self._store(model).pop(rid, None)
         return True
 
+    async def undo_bank_match(self, statement_line_id: int) -> Any:
+        """OdooClient's one path for undoing a bank match. Recorded as a call named undo_bank_match."""
+        self.calls.append(Call("account.bank.statement.line", "undo_bank_match", [statement_line_id], None, {}))
+        if ("account.bank.statement.line", "undo_bank_match") in self.errors:
+            raise self.errors[("account.bank.statement.line", "undo_bank_match")]
+        handler = getattr(self, "_undo_bank_match", None)
+        return handler(statement_line_id) if handler else None
+
     # ----------------------------------------------------------------- method emulation
 
     def _store(self, model: str) -> dict[int, dict]:

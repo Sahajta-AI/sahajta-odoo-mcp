@@ -38,6 +38,9 @@ _NEVER_SENT = ("unlink", "uninstall", "sudo")
 # module says) and only for explicit ids. The service's delete tool is its only caller.
 _DELETABLE_MODELS = frozenset({"account.move", "sale.order", "crm.lead"})
 _MAX_DELETE_IDS = 100
+# Undoing a bank match also deletes the payments linked to the bank line. It goes out only through
+# undo_bank_match(), for one bank line, whose caller (the bank unmatch tool) checks there are no payments.
+_UNDO_MATCH = ("account.bank.statement.line", "action_undo_reconciliation")
 
 # Read-only methods are retried when Odoo is busy; changes are never retried automatically.
 _SAFE_TO_RETRY = frozenset(
@@ -165,7 +168,7 @@ class OdooClient:
     ) -> Any:
         """Call a public model method with named arguments only."""
         lowered = method.lower()
-        if method.startswith("_") or any(part in lowered for part in _NEVER_SENT):
+        if method.startswith("_") or any(part in lowered for part in _NEVER_SENT) or lowered == _UNDO_MATCH[1]:
             raise OdooError(f"refusing to send '{method}' to Odoo", kind="access")
         if model in HARD_BLOCKED_MODELS or model.startswith(HARD_BLOCKED_PREFIXES):
             raise OdooError(f"refusing to call blocked model '{model}'", kind="access")
@@ -185,6 +188,15 @@ class OdooClient:
         ):
             raise OdooError("refusing to delete: give 1 to 100 record ids", kind="access")
         return await self._send(model, "unlink", ids=list(ids), context=None, kwargs={})
+
+    async def undo_bank_match(self, statement_line_id: int) -> Any:
+        """Undoes the matching of one bank line (Odoo's action_undo_reconciliation): the only path that sends it.
+
+        Odoo also deletes any payment linked to the line, so the caller checks there is none. Never retried.
+        """
+        if not (isinstance(statement_line_id, int) and not isinstance(statement_line_id, bool) and statement_line_id > 0):
+            raise OdooError("refusing to undo a bank match: give one bank line id", kind="access")
+        return await self._send(_UNDO_MATCH[0], _UNDO_MATCH[1], ids=[statement_line_id], context=None, kwargs={})
 
     async def _send(self, model: str, method: str, *, ids: list[int] | None, context: dict | None, kwargs: dict) -> Any:
         await self._ensure_protocol()

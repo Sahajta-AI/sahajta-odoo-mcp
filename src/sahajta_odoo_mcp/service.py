@@ -2,7 +2,7 @@
 
 This is the only module that sends data-changing calls to Odoo, and it only ever
 sends: create, write (web_save_multi for several records with their own values), a UI
-button method, message_post, copy of a file (ir.attachment, so Odoo duplicates its content),
+button method, the accounting steps in accounting.py (bank matching, the tax lock date, correcting a posted bill), message_post, copy of a file (ir.attachment, so Odoo duplicates its content),
 or message_subscribe / message_unsubscribe (followers). Deleting has one path only:
 OdooService.delete, through OdooClient.delete_records, for the records policy.DELETABLE names
 (the client refuses unlink through every other call). Previews only read (onchange computes a
@@ -31,6 +31,7 @@ from typing import Any
 import httpx
 
 from . import guide
+from .accounting import AccountingTools
 from .audit import AuditLog
 from .config import Settings
 from .confirm import ConfirmationSigner
@@ -450,7 +451,7 @@ class Shared:
     facts_cache: dict = field(default_factory=dict)  # what the guide read from each person's Odoo (see guide.py)
 
 
-class OdooService:
+class OdooService(AccountingTools):
     def __init__(self, shared: Shared, client: OdooClient, identity: OdooIdentity):
         self.shared = shared
         self.settings = shared.settings
@@ -1023,6 +1024,7 @@ class OdooService:
                     "approval_valid_for": self.shared.signer.valid_for,
                     "note": "Odoo's own access rights for this user also apply to everything.",
                 },
+                "lock_dates": await self.lock_dates_shown(),
                 "bill_inbox": inboxes or (
                     ("Not found: Odoo did not say" if facts.inboxes is None else "Not set up: no purchases journal has "
                      "an e-mail address") + ". odoo_help topic vendor_bills says where it is set."

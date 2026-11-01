@@ -27,7 +27,7 @@ anything a person did not see and approve**.
    inside one change, 200 records per read (hard cap 1000), 120 reads and 30 writes per person per minute, one Odoo
    request at a time (Odoo Online's fair-use policy), bounded response sizes and nesting depth.
 7. **Last-line guard.** The low-level Odoo client refuses to transmit `unlink` (except through its one delete path,
-   which re-checks the allowed records itself), `uninstall`, `sudo` or any `_private` method, or any call to a credentials/system model, whatever the layers above decided. It also never
+   which re-checks the allowed records itself), `uninstall`, `sudo` or any `_private` method, or any call to a credentials/system model, whatever the layers above decided. Undoing a bank match (`action_undo_reconciliation`, which also deletes payments linked to the bank line) goes out only through its own path, for one bank line. It also never
    keeps cookies, so one person's Odoo session can never be attached to another person's request.
 8. **Audit.** Odoo's chatter/tracking records every change under the person's name. This server writes a JSON
    line for every tool call (user, tool, model, ids, field names, outcome; never values, never keys).
@@ -87,6 +87,21 @@ standing):
   record, or a file Odoo keeps in a field) onto a bill, invoice, journal entry or CRM lead; or copied by Odoo itself
   (the content never passes through Claude) onto a lead, bill, invoice, quotation or contact. Previews list each
   file's from and to.
+* Bank lines (`account.bank.statement.line`), through their own tools only, each with one preview and one approval
+  (the methods are never pressed as plain buttons): match a line with open invoices, bills or journal items (all of
+  each or part of it; posted items in the bank's currency, settling the line, never a line already matched or in a
+  locked period; a clear warning when an item is for another partner), or book it to an account (not a customer or
+  vendor account); undo a match (cancel switch), refused before the approval and again right before it when any
+  payment is linked to the line, because Odoo would delete it. Previews are worked out by the connector from Odoo's
+  data; nothing is changed to make them.
+* Tax return lock date: only moved forward, up to today, through `odoo_preview_lock_date` (it shows all five lock
+  dates and how many entries with taxes it freezes). Odoo's lock date dialog is opened with only that date and is
+  checked to change nothing else before it is confirmed. The other lock dates, and moving any lock date back, stay
+  closed.
+* Correcting a posted vendor bill (cancel switch): reset to draft, add or edit lines, post again and optionally
+  match its bank line again, as one planned set of steps under one approval. Refused in a locked period (make a
+  credit note) and, for a bill already paid or sent, unless the person was told. Each step is sent once, in order;
+  the first failure stops the plan and the answer says where the bill and the bank line are.
 
 **Readable but never writable**: other accounting configuration (report definitions, payment methods, decimal
 precision), existing accounting setup (see above), bank details anywhere (any field pointing at a bank account),
@@ -95,7 +110,7 @@ own AI agents and prompts, e-mail digests and gateway settings, chat guests, pub
 countries, all technical `ir.*` models (views, menus, sequences, attachments…), users and
 groups (prevents privilege escalation and paid-seat creation), companies, currencies and rates, languages,
 mail queue, followers, aliases, mass mailing, SMS, WhatsApp, postal mail, website code and pages,
-accounting lock dates.
+accounting lock dates (except moving the tax lock date forward, above).
 
 **Fields**: anything named like a password, secret, token, API key, private key, TOTP/OTP, credential, passkey,
 signup, PIN, passphrase or hash is stripped from every answer and cannot be searched, sorted, grouped or
