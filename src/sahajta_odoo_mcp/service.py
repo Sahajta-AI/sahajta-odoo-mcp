@@ -30,7 +30,7 @@ from typing import Any
 
 import httpx
 
-from . import guide
+from . import guide, reports
 from .audit import AuditLog
 from .config import Settings
 from .confirm import ConfirmationSigner
@@ -106,6 +106,7 @@ _HELP_POINTER = (
 )
 # Reading a file already in Odoo (odoo_read_file). Nothing above _FILE_MAX_BYTES is downloaded. An image goes back
 # base64-encoded (a third bigger) and Vercel answers at most 4.5 MB, so images stop at 3 MB.
+_REPORT_MAX_CHARS = 60_000  # an accounting report's answer, well under what the platform carries in time
 _FILE_MAX_BYTES = 15 * 1024 * 1024
 _IMAGE_MAX_BYTES = 3 * 1024 * 1024
 _IMAGE_TYPES = {b"\x89PNG\r\n\x1a\n": "image/png", b"\xff\xd8\xff": "image/jpeg"}  # and RIFF....WEBP, checked apart
@@ -1334,6 +1335,159 @@ class OdooService:
                 else "One match."
             )
             return {"model": model, "matches": matches, "hint": hint}
+
+    async def report(self, report: Any, date_from: Any, date_to: Any, account_or_partner: Any = None, unfold: Any = None) -> dict:
+        """odoo_report: one of Odoo's official accounting reports for a period, as compact lines of numbers.
+
+        Only reads (get_options, get_report_information, get_expanded_lines), so it works in read-only mode;
+        Odoo's access rights decide whether this user may see the report at all.
+        """
+        async with self._op("odoo_report", "read", model="account.report"):
+            self.policy.check_read("account.report")
+            entry, gst_return = reports.find_report(report)
+            start, end = reports.day(date_from, "date_from"), reports.day(date_to, "date_to")
+            wanted = [t.strip() for t in (account_or_partner, unfold) if isinstance(t, str) and t.strip()]
+            if any(t is not None and not isinstance(t, str) for t in (account_or_partner, unfold)):
+                raise ValidationFailed("account_or_partner and unfold must be a name, e.g. '100201 Bank' or 'Vercel'")
+            if len({t.lower() for t in wanted}) > 1:
+                raise ValidationFailed("give one line to open: account_or_partner or unfold, not two different ones")
+            target = wanted[0] if wanted else None
+            if entry.ledger and not target:
+                other = ("the trial balance has every account's totals" if entry.ledger == "account"
+                         else "aged receivable and aged payable have each partner's open amounts")
+                raise ValidationFailed(
+                    f"the {entry.key} is too long to show whole: give account_or_partner, the one {entry.ledger} to "
+                    f"open (name or code, e.g. '100201' or 'Bank' for an account, the contact's name for a partner). "
+                    f"For an overview, {other}"
+                )
+
+            found = await self.client.call(
+                "account.report", "search_read", domain=[["name", "in", list(entry.names)]],
+                fields=["id", "name", "root_report_id", "filter_date_range"], context={"lang": "en_US"},
+            )
+            rows = [r for r in found or [] if isinstance(r, dict) and r.get("name") in entry.names]
+            rows.sort(key=lambda r: (bool(r.get("root_report_id")), entry.names.index(r["name"])))
+            if not rows:
+                raise ValidationFailed(
+                    f"this Odoo has no {entry.key} report that your user can see (it needs the Accounting app and "
+                    f"access to its reports; ask {self.settings.mcp_admin_contact})"
+                )
+            row = rows[0]
+            previous = {
+                "date": reports.date_option(start, end, bool(row.get("filter_date_range"))),
+                "unfold_all": False,
+                "selected_variant_id": row["id"],  # otherwise the tax report opens an Indian TDS/TCS variant
+            }
+            options = await self.client.call("account.report", "get_options", ids=[row["id"]], previous_options=previous)
+            report_id = options.get("report_id") or row["id"]
+            info = await self.client.call("account.report", "get_report_information", ids=[report_id], options=options)
+            lines = [line for line in (info or {}).get("lines") or [] if isinstance(line, dict)]
+
+            opened = None
+            if target:
+                line = reports.pick_line(lines, target, entry.ledger or "line")
+                children = await self.client.call(
+                    "account.report", "get_expanded_lines", ids=[report_id], options=options,
+                    line_dict_id=line["id"], groupby=line.get("groupby"),
+                    expand_function_name=line.get("expand_function"), progress=line.get("progress") or {},
+                    offset=0, horizontal_split_side=None,
+                )
+                children = [c for c in children or [] if isinstance(c, dict)]
+                opened = str(line.get("name") or "")
+                at = lines.index(line)
+                lines = [line, *children] if entry.ledger else [*lines[: at + 1], *children, *lines[at + 1:]]
+            return await self._report_answer(entry, gst_return, start, row, options, info, lines, opened)
+
+    async def _report_answer(
+        self, entry: reports.Report, gst_return: bool, start: str | None, row: dict, options: dict, info: dict,
+        lines: list[dict], opened: str | None,
+    ) -> dict:
+        labels = reports.column_labels(options)
+        more_in_odoo = any(reports.is_load_more(line) for line in lines)
+        shown = [reports.trim_line(line, labels) for line in lines if not reports.is_load_more(line)]
+        kept = [line for line in shown if line["level"] in (0, None) or not reports.is_zero(line)]
+
+        when = options.get("date") or {}
+        period = ({"from": when.get("date_from"), "to": when.get("date_to")} if when.get("mode") == "range"
+                  else {"as_of": when.get("date_to")})
+        variants = {v.get("id"): v.get("name") for v in options.get("available_variants") or [] if isinstance(v, dict)}
+        warnings = info.get("warnings") or {}
+        drafts = reports.DRAFT_WARNING in warnings
+        others = [w for w in warnings if w != reports.DRAFT_WARNING]
+        companies = [c for c in options.get("companies") or [] if isinstance(c, dict)]
+        link = None
+        try:
+            actions = await self.client.call(
+                "ir.actions.client", "search_read", domain=[["tag", "=", "account_report"]], fields=["id", "context", "path"],
+            )
+            link = reports.action_link(self.client.creds.url, actions, row["id"])
+        except OdooError as exc:
+            logger.info("report link not found: %s", exc.kind)
+
+        notes = [
+            "Only posted entries count, as in Odoo's report. "
+            + ("There ARE draft entries in this period that are not counted: tell the person; they appear once posted."
+               if drafts else "Odoo shows no draft entries in this period."),
+            "Values are Odoo's own figures (raw numbers, not rounded by Odoo); a line without a value has no amount "
+            "there. Lines where every amount is zero are left out.",
+            f"Line names (accounts, contacts, entry labels) come from Odoo records{_DATA}.",
+        ]
+        if start and "as_of" in period:
+            notes.append(f"The {entry.key} is as of one day ({period['as_of']}); date_from is not used.")
+        if entry.key == "tax report" and gst_return:
+            notes.insert(0, reports.GST_RETURN_NOTE)
+        if more_in_odoo:
+            notes.append("Odoo gave only its first entries for this line; the rest are in Odoo (link), or ask for a "
+                         "shorter period.")
+        if others:
+            notes.append("Odoo shows other warnings on this report: tell the person to open it in Odoo to read them.")
+        if shown and not kept:
+            notes.append("Every amount in this report is zero for this period: there is nothing to show.")
+        if not opened and any(line.get("can_open") for line in kept):
+            notes.append("Lines with can_open have detail: call again with unfold set to the line's name.")
+
+        payload: dict[str, Any] = {
+            "report": variants.get(options.get("report_id")) or row.get("name") or entry.key,
+            "period": period,
+            "currency": await self._report_currency(companies, options),
+            "columns": labels,
+            "lines": kept,
+            "drafts_in_period": drafts,
+        }
+        if opened:
+            payload["opened"] = opened
+        if len(companies) > 1:
+            payload["companies"] = [c.get("name") for c in companies]
+        payload["open_in_odoo"] = link or f"{guide.MENUS['account.menu_finance_reports'][0]} → {payload['report']}"
+        payload["notes"] = notes
+        return self._fit_report(payload)
+
+    async def _report_currency(self, companies: list[dict], options: dict) -> str | None:
+        currency_id = companies[0].get("currency_id") if companies else None
+        if isinstance(currency_id, int) and not isinstance(currency_id, bool):
+            try:
+                rows = await self.client.call("res.currency", "read", ids=[currency_id], fields=["name"])
+                if rows and rows[0].get("name"):
+                    return rows[0]["name"]
+            except OdooError as exc:
+                logger.info("report currency not read: %s", exc.kind)
+        units = (options.get("rounding_unit_names") or {}).get("units") or []
+        return units[0] if units and isinstance(units[0], str) else None
+
+    def _fit_report(self, payload: dict) -> dict:
+        """Cuts lines from the end until the answer is compact (a report is read, never approved, so a cut is fine)."""
+        cap = min(self.settings.mcp_max_response_chars, _REPORT_MAX_CHARS)
+        lines = payload["lines"]
+        kept = lines[: reports.MAX_LINES]
+        while kept and len(json.dumps({**payload, "lines": kept}, ensure_ascii=False, default=str)) > cap - 400:
+            kept = kept[: int(len(kept) * 0.8)]
+        if len(kept) < len(lines):
+            payload = {**payload, "lines": kept, "truncated_for_size": True}
+            payload["notes"] = [*payload["notes"], (
+                f"Only the first {len(kept)} of {len(lines)} lines fit in one answer. Ask for a shorter period or one "
+                "account or partner, or open the full report in Odoo (open_in_odoo)."
+            )]
+        return payload
 
     async def list_actions(self, model: str) -> dict:
         async with self._op("odoo_list_actions", "read", model=model):

@@ -493,6 +493,8 @@ class FakeOdoo:
     menus: dict[str, str] | None = None
     # what reached the one delete path (OdooClient.delete_records): [(model, ids)]
     deleted: list[tuple[str, list[int]]] = field(default_factory=list)
+    # accounting reports (account.report), {report id: see add_reports}; served by get_options & co
+    reports: dict[int, dict] = field(default_factory=dict)
 
     instances = []  # class-level registry (not a dataclass field: no annotation)
 
@@ -672,9 +674,119 @@ class FakeOdoo:
             parent["xmlid"] = xmlid
         return tree
 
+    def _m_get_options(self, model, ids, context, previous_options=None):
+        """account.report get_options: the report (or the variant asked for) with the dates asked for."""
+        report = self.reports[ids[0]]
+        prev = previous_options or {}
+        chosen = prev.get("selected_variant_id")
+        rid = chosen if chosen in report.get("variants", [ids[0]]) else report.get("default_variant", ids[0])
+        shown = self.reports[rid]
+        return {
+            "report_id": rid,
+            "date": {**prev.get("date", {}), "string": "shown in the person's format"},
+            "available_variants": [{"id": v, "name": self.reports[v]["name"]} for v in report.get("variants", [ids[0]])],
+            "companies": [{"name": "Sahajta", "id": 1, "currency_id": 20}],
+            "columns": copy.deepcopy(shown["columns"]),
+            # as in Odoo, a header's forced_options are part of its group's, and their orders may differ
+            "column_groups": {g: {"forced_options": {"block": g, "no_impact_on_currency_table": True}, "forced_domain": []}
+                              for g in shown.get("groups", ["g1"])},
+            "column_headers": [[{"name": name, "forced_options": {"block": g}}
+                                for name, g in shown.get("headers", [("the period", "g1")])]],
+            "rounding_unit_names": {"units": ["₹", ""]},
+            "all_entries": False,
+            "unfold_all": prev.get("unfold_all", False),
+        }
+
+    def _m_get_report_information(self, model, ids, context, options=None):
+        report = self.reports[ids[0]]
+        return {"lines": copy.deepcopy(report["lines"]), "warnings": copy.deepcopy(report.get("warnings", {}))}
+
+    def _m_get_expanded_lines(self, model, ids, context, line_dict_id=None, **kw):
+        return copy.deepcopy(self.reports[ids[0]].get("expanded", {}).get(line_dict_id, []))
+
     def _m_name_search(self, model, ids, context, name="", operator="ilike", limit=50, **kw):
         store = self._store(model)
         return [[i, r.get("name")] for i, r in sorted(store.items()) if name.lower() in str(r.get("name", "")).lower()][:limit]
+
+
+def _col(label: str, group: str = "g1") -> dict:
+    return {"name": label, "expression_label": label.lower(), "column_group_key": group}
+
+
+def _line(lid: str, name: str, level: int, *values: Any, unfoldable: bool = False) -> dict:
+    """A report line as get_report_information returns it: raw values in no_format, shown text in name."""
+    columns = [{"no_format": v, "name": f"{v:,}" if isinstance(v, float) else v} for v in values]
+    return {"id": lid, "name": name, "level": level, "columns": columns, "unfoldable": unfoldable,
+            "expand_function": "_report_expand_unfoldable_line_with_groupby" if unfoldable else None}
+
+
+def add_reports(fake: FakeOdoo) -> FakeOdoo:
+    """Accounting reports shaped like Odoo 19's answers on the company database (ids as there, never relied on)."""
+    draft = {"account_reports.common_warning_draft_in_period": {"alert_type": "warning"}}
+    names = {7: ("Profit and Loss", True), 4: ("Balance Sheet", False), 12: ("Trial Balance", True),
+             11: ("General Ledger", True), 14: ("Partner Ledger", True), 9: ("Aged Receivable", False),
+             10: ("Aged Payable", False), 1: ("Generic Tax report", True), 22: ("ACT 1961 TCS Report (IN)", True)}
+    fake.records["account.report"] = {
+        rid: {"name": name, "filter_date_range": ranged, "root_report_id": [1, "Generic Tax report"] if rid == 22 else False}
+        for rid, (name, ranged) in names.items()
+    }
+    fake.records["ir.actions.client"] = {
+        690: {"name": "Profit and Loss", "context": "{'report_id': 7}", "path": "profit-and-loss"},
+        693: {"name": "General Ledger", "context": "{'report_id': 11}", "path": False},
+        691: {"name": "Tax Return", "context": "{'report_id': 1}", "path": "tax-report"},
+    }
+    fake.records["res.currency"] = {20: {"name": "INR"}}
+    pl = "~account.report~7|~account.report.line~"
+    gl = '~account.report~11|~account.report.line~68|{"groupby": "account_id"}~account.account~'
+    fake.reports.update({
+        7: {"name": "Profit and Loss", "columns": [_col("Balance")], "warnings": draft, "lines": [
+            _line(pl + "45", "Revenue", 1, 450397.45, unfoldable=True),
+            _line(pl + "46", "Less Costs of Revenue", 1, 54972.62, unfoldable=True),
+            _line(pl + "47", "Gross Profit", 0, 395424.83),
+            _line(pl + "48", "Less Operating Expenses", 1, 73286.31999999999, unfoldable=True),
+            _line(pl + "49", "Plus Other Income", 1, 0),
+            _line(pl + "50", "Net Profit", 0, 322138.51),
+        ], "expanded": {pl + "48": [
+            _line(pl + "48|~account.account~50", "210200 Office Rent", 2, 12713.3),
+            _line(pl + "48|~account.account~51", "210300 Software", 2, 60573.02),
+        ]}},
+        4: {"name": "Balance Sheet", "columns": [_col("Balance")], "lines": [
+            _line("~account.report~4|~account.report.line~1", "ASSETS", 0, 424712.08),
+            _line("~account.report~4|~account.report.line~3", "Bank and Cash Accounts", 5, 418207.38, unfoldable=True),
+            _line("~account.report~4|~account.report.line~6", "Prepayments", 5, 0),
+        ]},
+        12: {"name": "Trial Balance", "groups": ["period", "init", "end"],
+             "headers": [("Initial Balance", "init"), ("01/04/2026 - 31/10/2026", "period"), ("End Balance", "end")],
+             "columns": [_col("Balance", "init"), _col("Debit", "period"), _col("Credit", "period"), _col("Balance", "end")],
+             "lines": [_line("tb|103", "100201 Bank", 2, 100000.0, 455889.4, 137682.02, 418207.38)]},
+        11: {"name": "General Ledger", "warnings": draft,
+             "columns": [_col("Date"), _col("Partner"), _col("Currency"), _col("Debit"), _col("Credit"), _col("Balance")],
+             "lines": [
+                 _line(gl + "103", "100201 Bank", 2, None, None, None, 555889.4, 137682.02, 418207.38, unfoldable=True),
+                 _line(gl + "104", "100202 Bank Suspense Account", 2, None, None, None, 4040.0, 0.0, 4040.0, unfoldable=True),
+                 _line(gl + "2", "100400 Debtors", 2, None, None, None, 450397.45, 450397.95, -0.5, unfoldable=True),
+             ],
+             "expanded": {gl + "103": [
+                 _line(gl + "103|~~balance_line_103", "Initial Balance", 3, None, None, None, 356290.51, 65983.79, 290306.72),
+                 _line(gl + '103|~~["2026-10-02", 455]', "BNK1/26-27/0079 Twitterapi.Io", 3, "2026-10-02", "twitterapi.io",
+                       None, 0.0, 1001.46, 289305.25999999995),
+                 _line(gl + "103|~~loadMore", "Load more...", 3),
+             ]}},
+        14: {"name": "Partner Ledger", "columns": [_col("Debit"), _col("Credit"), _col("Balance")], "lines": [
+            _line("~account.report~14|~res.partner~398", "Vercel", 1, 6564.36, 4277.95, 2286.41, unfoldable=True),
+        ], "expanded": {"~account.report~14|~res.partner~398": [
+            _line("~account.report~14|~res.partner~398|0~account.move.line~551", "BNK1/26-27/0109 Vercel Inc", 3, 48.44, 0.0, 48.44),
+        ]}},
+        1: {"name": "Generic Tax report", "variants": [1, 22], "default_variant": 22, "warnings": draft,
+            "columns": [_col("Net"), _col("Tax")], "lines": [
+                _line("~account.report~1|purchase~~", "Purchases", 0, "", 180.0),
+                _line("~account.report~1|purchase~~|~account.tax~46", "18% IGST P (18.0%)", 2, 1000.0, 180.0),
+            ]},
+        22: {"name": "ACT 1961 TCS Report (IN)", "columns": [_col("Balance")], "lines": [
+            _line("~account.report~22|~account.report.line~73", "Section 206C(1): Scrap", 1, 0),
+        ]},
+    })
+    return fake
 
 
 @pytest.fixture

@@ -34,7 +34,7 @@ INSTRUCTIONS = """\
 You are connected to the company's Odoo ERP, acting as the signed-in employee with their Odoo permissions.
 
 Ground rules:
-1. Never just say something is not possible. When no tool fits a request (a file shared in the chat, a report,
+1. Never just say something is not possible. When no tool fits a request (a file shared in the chat, a GST return,
    deleting...) or a tool refuses it, call odoo_help for that area and give the person the way: what you can do,
    what you cannot and why (one line), and the exact steps to do the rest in Odoo. When you need information
    from the person, ask for one item at a time.
@@ -74,6 +74,8 @@ own steps are in odoo_help):
   makes a draft credit note to post with action_post.
 - Lead lost: crm.lead "dialog:crm.lead.lost" with dialog_values {"lost_reason_id": <id from crm.lost.reason>}.
 - Vendor bills and the bill inbox, PDFs and other files, bank matching: odoo_help topics vendor_bills, files, bank.
+- Official accounting reports (P&L, balance sheet, trial balance, ledgers, ageing, tax/GST) for a period:
+  odoo_report; ledgers one account or partner at a time.
 """
 
 _READ = dict(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
@@ -205,7 +207,7 @@ def register_tools(
         """The guide for the person, for one area of Odoo: what Claude can do here (with the tool flow), what it cannot
         and why, the exact steps to do the rest in Odoo, and what to ask the person (one item at a time). Use it
         whenever the person asks what is possible, when a request has no matching tool (e.g. a file or PDF shared in
-        the chat, an official report, deleting), and after any refusal (refusals name their topic)."""
+        the chat, a GST return, deleting), and after any refusal (refusals name their topic)."""
         return await run(lambda s: s.guide(topic))
 
     @mcp.tool(title="List Odoo models", annotations=ToolAnnotations(title="List Odoo models", **_READ), structured_output=False)
@@ -275,6 +277,23 @@ def register_tools(
         """Look up records by their display name, the way Odoo's search box does. Use this to turn names the person
         mentions into real record ids. If several match, ask which one they mean."""
         return await run(lambda s: s.find(model, name, limit, domain), model=model)
+
+    @mcp.tool(title="Read an accounting report", annotations=ToolAnnotations(title="Read an accounting report", **_READ), structured_output=False)
+    async def odoo_report(
+        report: Annotated[str, Field(description="Which report: profit and loss, balance sheet, trial balance, general ledger, "
+                                                 "partner ledger, aged receivable, aged payable, or tax report (GST by tax).")],
+        date_to: Annotated[str, Field(description="Last day of the period, YYYY-MM-DD. Balance sheet and aged reports are as of this day.")],
+        date_from: Annotated[str | None, Field(description="First day of the period, YYYY-MM-DD (not used by balance sheet and aged reports).")] = None,
+        account_or_partner: Annotated[str | None, Field(description="Ledgers only, and needed there: the one account (code or name) "
+                                                                    "or partner (contact name) to open with its entries.")] = None,
+        unfold: Annotated[str | None, Field(description="Name of a line marked can_open in an earlier answer, to show its detail "
+                                                        "(e.g. 'Operating Expenses', or a customer in aged receivable).")] = None,
+    ) -> str:
+        """Odoo's official accounting report for a period, as Odoo computes it: report name, period, currency, the
+        lines with their amounts by column, whether draft entries exist, and the link to open it in Odoo. Use it for
+        Profit and Loss, Balance Sheet, ledgers, ageing and GST/tax figures instead of adding entries up yourself.
+        Never a file: to download PDF or Excel, the person opens the link."""
+        return await run(lambda s: s.report(report, date_from, date_to, account_or_partner, unfold), model="account.report")
 
     @mcp.tool(title="List buttons/actions of a model", annotations=ToolAnnotations(title="List buttons/actions of a model", **_READ), structured_output=False)
     async def odoo_list_actions(model: Model) -> str:

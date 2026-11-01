@@ -826,18 +826,28 @@ TOPICS: dict[str, Topic] = {
             Can("Totals and breakdowns worked out by Odoo: sales by month, unpaid invoices by customer, spend by "
                 "vendor.", "odoo_aggregate (Odoo adds up), odoo_count"),
             Can("Lists: overdue invoices, bills due this week, top customers.", "odoo_search with order and limit"),
+            Can("Read Odoo's official accounting reports for a period, with the same numbers as in Odoo: Profit and "
+                "Loss, Balance Sheet, Trial Balance, General Ledger and Partner Ledger (one account or partner at a "
+                "time), Aged Receivable and Aged Payable, and the tax report (GST by tax). Claude also says whether "
+                "draft entries are left out, and gives the link to open the report in Odoo.",
+                "odoo_report (report, date_from, date_to; account_or_partner for ledgers; unfold to open a line)"),
         ),
         cannot=(
-            ("Make official reports (Profit and Loss, Balance Sheet, GST returns, ledgers)",
-             "they are built in Odoo's reporting screens"),
+            ("Make GST returns (GSTR-1, GSTR-3B)",
+             "this Odoo has no GSTR report; Claude gives the GST figures from the tax report instead"),
+            ("Show a whole ledger with every entry at once",
+             "it is too long for one answer; Claude opens one account or partner at a time"),
+            ("Count draft entries in a report", "Odoo's reports count only posted entries; Claude says when drafts exist"),
             ("Make files (PDF or Excel)", _FILES_WHY),
         ),
         yourself=_steps(
             "Official reports: {menu:account.menu_finance_reports}, pick the report and the dates; download it "
-            "from the report's own buttons.",
+            "from the report's own buttons (PDF or XLSX). Claude's link opens the same report.",
         ),
         needs=(
+            "Which report.",
             "Which period.",
+            "For a ledger: which account or partner.",
             "Which customers, vendors or products.",
             "How to group it: by month, customer, product.",
         ),

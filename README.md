@@ -36,6 +36,7 @@ integration (this one, Odoo's own MCP, or any community server) can connect.
 | `odoo_search` / `odoo_read` / `odoo_count` | Find and read records | always |
 | `odoo_aggregate` | Totals and breakdowns computed by Odoo (revenue by month, pipeline by stage) | always |
 | `odoo_find` | Turn a name the person mentions into the right record | always |
+| `odoo_report` | Odoo's official accounting reports for a period as numbers and lines (P&L, balance sheet, trial balance, ledgers one account or partner at a time, ageing, tax report), with the link to open them | always |
 | `odoo_list_actions` | The buttons on a model's screens and whether the AI may press them | always |
 | `odoo_preview_create` → `odoo_create` | Create records (with order lines etc.) | read_write |
 | `odoo_preview_update` → `odoo_update` | Change field values | read_write |
